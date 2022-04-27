@@ -1,0 +1,11 @@
+{
+  "base":"/storage/complex_assembly/",
+  "pdb":"/storage/databases/pdb/biounits_expanded/",
+  "uni":"/storage/databases/uniprot_sprot.dat",
+  "tmp":"/home/gabriele/Desktop/tmp/",
+  "seqres":"data/seqres",
+  "mmseq":{
+    "seq_id":"0.25",
+    "e_value":"0.001"
+  }
+}
