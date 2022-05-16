@@ -8,7 +8,9 @@ import errno
 import signal
 import pickle
 import string
+import shutil
 import numpy as np
+import subprocess as sp
 
 from Bio.PDB.Chain import Chain
 from Bio.PDB.Model import Model
@@ -28,7 +30,11 @@ from Bio import pairwise2
 from Bio.Align import substitution_matrices
 blosum62 = substitution_matrices.load("BLOSUM62")
 
+from itertools import combinations
 from tmtools import tm_align
+
+import matplotlib.pyplot as plt
+import seaborn as sb
 
 standard_residues = [
     'A','R','N','D','C','Q','E','G','H','I',
@@ -93,6 +99,16 @@ def timeout(seconds=10, error_message=os.strerror(errno.ETIME)):
 
 
 
+def progression(label=''):
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            for progression in func(*args, **kwargs):
+                print (f'{label} progression: {progression}')
+        return wrapper
+    return decorator
+
+
+
 @timeout(60)
 def load_structure(path, parser):
     return parser.get_structure('', path)
@@ -100,19 +116,26 @@ def load_structure(path, parser):
 
 
 class DataCleaner():
-    def __init__(self, pdblist, data_folder, tmp_folder):
+
+
+    def __init__(self, 
+                 pdblist, 
+                 data_folder, 
+                 tmp_folder):
 
         with open(pdblist) as list_file:
             self.pdblist = [line.strip() for line in list_file]
 
         self.data_folder = data_folder
         self.tmp_folder = tmp_folder
-
+        if not os.path.exists(tmp_folder): os.mkdir(tmp_folder)
+        
         self.pdbp = PDBParser(QUIET=True)
         self.cifp = MMCIFParser(QUIET=True)
 
 
-    def uniprot_mapping(self, uniprot_path):
+    def uniprot_mapping(self, 
+                        uniprot_path):
         '''
         Load a pdb-uniprot mapping in order to allow fast recognition and 
         exclusion of identical structures
@@ -145,8 +168,9 @@ class DataCleaner():
 
         self.uni_mapping = uni_mapping
 
-
-    def parse_seqres(self, database_folder):
+    @progression(label='Seqres parsing')
+    def parse_seqres(self,
+                     database_folder):
         '''
         Given a local sync of the pdb, find out complexes containing
         non-standard amino-acid chains (mod.res, DNA, RNA) and structures
@@ -175,7 +199,7 @@ class DataCleaner():
 
         '''
 
-######## compute path list
+        #compute path list
         path_list = []
         for pdb_code in self.pdblist:
             for n in range(1,10):
@@ -187,22 +211,23 @@ class DataCleaner():
         pdb_dict = {} 
         parsed_sets = []
         faults = {'N':[], 'U':[], 'M':[]}
-######## cycle over paths
+        
+        #cycle over paths
         for path_idx, (pdb_code, str_path) in enumerate(path_list):
             str_format = str_path.split('.')[-1]
 
-############ compute progression
+            #compute progression
             actual = int((float(path_idx+1)/len(path_list))*100)
             progression = '# {}% done! '.format(actual)
 
-############ check complex is in swissprot and the set of uniprot ids
-############ it contains hasn't been parsed yet
+            #check complex is in swissprot and the set of uniprot ids
+            #it contains hasn't been parsed yet
             if pdb_code in self.uni_mapping: 
                 if self.uni_mapping[pdb_code] in parsed_sets: 
                     print (progression, str_path, '### Discarded! Redundant')
                     continue
 
-############ get seqres info from file header
+            #get seqres info from file header
             with open(str_path) as handle:
                 if 'pdb' in str_format:
                     seqres = {record.id:str(record.seq)
@@ -211,24 +236,24 @@ class DataCleaner():
                     seqres = {record.id:str(record.seq)
                         for record in CifSeqresIterator(handle)}
 
-############ load structure
+            #load structure
             if 'pdb' in str_format:
                 struc = load_structure(str_path, self.pdbp)
             if 'cif' in str_format:
                 struc = load_structure(str_path, self.cifp)
             if not struc: continue
 
-############ parse structure chains
+            #parse structure chains
             str_chains = []
             for model in struc:
                 for chain in model:
                     if is_chain_valid(chain):
                         str_chains.append(chain.get_id())
 
-############ quality controls
+            #quality controls
             valid_assembly = True
 
-############ check seqres is not containing DNA/RNA
+            #check seqres is not containing DNA/RNA
             if valid_assembly:
                 for idx, seq in seqres.items():
                     vocabulary = set([letter for letter in seq \
@@ -241,7 +266,7 @@ class DataCleaner():
                             faults['N'].append(pdb_code)
                         break
 
-############ check PDB have no sequences with unknown residues
+            #check PDB have no sequences with unknown residues
             if valid_assembly:
                 unknown_residues = False
                 for key, seq in seqres.items():
@@ -256,9 +281,9 @@ class DataCleaner():
                         faults['U'].append(pdb_code)
 
 
-############ check seqres seqs have corresponding coordinates
-############ and skip assemblies with only one matching seq/str
-############ or containing inconsistencies
+            #check seqres seqs have corresponding coordinates
+            #and skip assemblies with only one matching seq/str
+            #or containing inconsistencies
             if valid_assembly:
                 seq_chains = list(seqres.keys())
                 for chain in seq_chains:
@@ -272,14 +297,14 @@ class DataCleaner():
                     if pdb_code not in faults['M']:
                         faults['M'].append(pdb_code)
 
-############ sum up quality controls
+            #sum up quality controls
             if valid_assembly:
-                print (progression, str_path)
+                yield f'{progression} {str_path}'
             else:
-                print (progression, str_path, '### Discarded!', fault)
+                yield f'{progression} {str_path} ### Discarded! {fault}'
                 continue
 
-############ store in object data
+            #store in object data
             pdb_dict[pdb_code] = {}
             pdb_dict[pdb_code]['chain_num'] = len(str_chains)
             pdb_dict[pdb_code]['seqres'] = copy.deepcopy(seqres)
@@ -290,20 +315,20 @@ class DataCleaner():
             if pdb_code in self.uni_mapping: 
                 parsed_sets.append(self.uni_mapping[pdb_code])
 
-######## write partial good structures data
+            #write partial good structures data
             if len(pdb_dict)%1000:
                 with open(self.data_folder+'/seqres.pkl', 'wb') as f:
                     pickle.dump(pdb_dict, f)
 
-######## write good structures data
+        #write good structures data
         with open(self.data_folder+'/seqres.pkl', 'wb') as f:
             pickle.dump(pdb_dict, f)
 
-######## write faulty codes
+        #write faulty codes
         with open(self.data_folder+'/faulty.pkl', 'wb') as f:
             pickle.dump(faults, f)
 
-######## summary
+        #summary
         print (f'Found:')
         print (f'{len(pdb_dict)} acceptable structures')
         print (f'{len(faults["N"])} structures containing nucleic acids')
@@ -316,60 +341,97 @@ class DataCleaner():
         load seqres.pkl
         '''
 
-######## check seqres.pkl exists
-        assert os.path.exists(self.data_folder+'/seqres.pkl') \
+        #check seqres.pkl exists
+        assert os.path.exists(self.data_folder+'/seqres.pkl'), \
             'parse_seqres() method has to be used first to generate seqres.pkl'
 
-######## load seqres info
+        #load seqres info
         with open(self.data_folder+'/seqres.pkl', 'rb') as f:
             seqres = pickle.load(f)
         return seqres
 
 
-    def find_heteromers(self):
+    def find_complex_homology(self,
+                              pdb_list,
+                              output_name,
+                              MMbinary=None,
+                              TMbinary=None):
         '''
-        go over all asseblies data contained in the seqres.pkl file and return a subset 
-        of hetero assemblies pdb codes.
-
         '''
         
-        heteromers = []
         seqres = self.load_seqres()
-        for pdb in seqres:
-############ if there is uniprot information, chech at least 2 different 
-############ uniprot codes are present in the same pdb
-            if pdb in self.uni_mapping:
-                if len(self.uni_mapping[pdb]) > 1: heteromers.append(pdb)
+        for idx, pdb in enumerate(pdb_list):
+            
+            all_fasta = ''
+            uniq_seqres = []
+            for chain, seq in seqres[pdb]['seqres'].items():
+                if seq not in uniq_seqres: uniq_seqres.append(seq)
+                else: continue
+                all_fasta += f'>{pdb}_{chain_id}\n{seq}\n'
+            with open(output_name, 'w') as out: out.write(all_fasta)
 
-############ otherwise run pairwise alignments all vs all using seqres
-            else:
-                het = False
-                for idx1, c1 in enumerate(seqres[pdb]['seqres']):
-                    for idx2, c2 in enumerate(seqres[pdb]['seqres']):
-                        if idx1 <= idx2: continue
-                        if seqres[pdb]['seqres'][c1] == seqres[pdb]['seqres'][c2]: continue
-                        
-                        seq1 = seqres[pdb]['seqres'][c1]
-                        seq2 = seqres[pdb]['seqres'][c2]
-                        alignments = pairwise2.align.globalds(seq1, seq2, blosum62, -10, -0.5)
-                        aligned1 = alignments[0][0]
-                        aligned2 = alignments[0][1] 
-                        identity = sum([1 for pos1, pos2 in zip(aligned1, aligned2) \
-                            if pos1 == pos2]) / len(aligned1)
+            command = [binary,
+                       'createdb',
+                       input_data,
+                       self.tmp_folder+'/seqdb']
+            sp.run(command)
 
-######################## calculate alignment identity
-                        if identity < 0.9: het = True
-                        if het: break
-                    if het: break
-                if het: heteromers.append(pdb)
-        return heteromers
+            command = [binary,
+                       'search',
+                       self.tmp_folder+'/seqdb',
+                       self.tmp_folder+'/seqdb',
+                       self.tmp_folder+'/seqdb',
+                       self.tmp_folder,
+                       '-a','1','-s',7.5,
+                       '--alignment-mode','3',
+                       '--alignment-output-mode','3']
 
+            command = [binary,
+                   'createtsv',
+                   self.tmp_folder+'/seqdb',
+                   self.tmp_folder+'/seqdb',
+                   self.tmp_folder+'/clustering',
+                   target_folder+'/'+output_name]
+            sp.run(command)
 
-    def create_str_folder(self, pdb_list, target_folder):
+                chain_names.append(f'{pdb}_{chain}.pdb')
+                with open(f'{self.tmp_folder}/{pdb}_{chain}.pdb','w') as out:
+                    for line in open(seqres[pdb]['full_path']):
+                        if line.startswith('ATOM') and line[20:22].strip() == chain:
+                            out.write(line)
+
+            avg_tm = 0
+            comb = list(combinations(chain_names, 2))
+            print (len(comb))
+            if len(comb) == 0: continue
+            for c1, c2 in comb:
+                command = [binary,
+                           f'{self.tmp_folder}/{c1}',
+                           f'{self.tmp_folder}/{c2}']
+                try:
+                    tmalign_out = sp.run(command, capture_output=True, timeout=60)
+                    tmalign_out = tmalign_out.stdout.decode('UTF-8')
+                    TMscore = max([float(line.split()[1]) for line in tmalign_out.split('\n') \
+                                   if line.startswith('TM-score=')])
+                except: continue
+                avg_tm += TMscore
+
+            tmscores.append(avg_tm/len(comb))
+
+            for path in glob.glob(self.tmp_folder+'/*.pdb'):
+                os.remove(path)
+            
+        return tmscores
+
+    def create_str_folder(self, 
+                          pdb_list, 
+                          target_folder):
         '''
-        save subset of pdb structures in a single folder
+        copy subset of pdb structures in a single folder
 
         '''
+
+        if not os.path.exists(target_folder): os.mkdir(target_folder)
 
         seqres = self.load_seqres()
         for pdb in pdb_list:
@@ -379,50 +441,81 @@ class DataCleaner():
             sp.run(command)
 
 
-    def create_seq_folder(self, pdb_list, target_folder):
+    @progression(label='Fetching fasta')
+    def fetch_str_fasta(self, 
+                        pdb_list, 
+                        target_folder=None, 
+                        target_fasta=None,
+                        from_structure=False):
         '''
         fetch sequences of pdb chains and save them in a single folder
 
         '''
-        
+        if target_folder:
+            if not os.path.exists(target_folder): os.mkdir(target_folder)
+        else:
+            all_fasta = ''
+
         seqres = self.load_seqres()
-        for pdb in pdb_list:
+        for idx, pdb in enumerate(pdb_list):
+            if from_structure:
+                seq = ''
+                str_path = seqres[pdb]['full_path']
+                struc = load_structure(str_path, self.pdbp)
+                for model in struc:
+                    for chain in model:
+                        chain_id = chain.get_id()
+                        for res in chain:
+                            res_id = res.get_resname()
+                            if res_id not in standard_residues_three: continue
+                            seq += three_to_one(res_id)
+                        if target_folder:
+                            with open(f'{target_folder}/{pdb}_{chain_id}.fasta', 'w') as out:
+                                out.write(f'>{pdb}_{chain_id}\n{seq}')
+                        else:
+                            all_fasta += f'>{pdb}_{chain_id}\n{seq}\n'
             
-            seq = ''
-            str_path = seqres[pdb]['full_path']
-            struc = load_structure(str_path, self.pdbp)
-            for model in struc:
-                for chain in model:
-                    chain_id = chain.get_id()
-                    for res in chain:
-                        res_id = res.get_resname()
-                        if res_id not in standard_residues_three: continue
-                        seq += three_to_one[res_id]
-
-                    with open(f'{target_folder}/{pdb}_{chain_id}.fasta') as out:
-                        out.write(f'>{pdb}_{chain_id}\n{seq}')
+            else:
+                for chain_id, seq in seqres[pdb]['seqres'].items():
+                    if target_folder:
+                        with open(f'{target_folder}/{pdb}_{chain_id}.fasta', 'w') as out:
+                            out.write(f'>{pdb}_{chain_id}\n{seq}')
+                    else:
+                        all_fasta += f'>{pdb}_{chain_id}\n{seq}\n'
 
 
-    def mmseq_clustering(self, binary, seq_folder, target_folder):
+            actual = int((float(idx+1)/len(pdb_list))*100)
+            progression = '# {}% done! '.format(actual)
+            yield progression
+
+        if target_fasta:
+            with open(target_fasta, 'w') as out: out.write(all_fasta)
+
+
+    def mmseq_clustering(self, 
+                         binary, 
+                         target_folder,
+                         input_fasta=None,
+                         output_name='clusters.tsv',
+                         thr='0.9'):
         '''
         launch mmseq to cluster fasta seqs contained in a single folder
 
         '''
-        
+        if input_fasta: input_data = input_fasta
+        elif input_folder: input_data = input_folder
+
         command = [binary,
                    'createdb',
-                   seq_folder,
-                   target_folder+'/seqdb']
+                   input_data,
+                   self.tmp_folder+'/seqdb']
         sp.run(command)
-
-        if not os.path.exists(self.tmp_folder+'/tmp'):
-            os.mkdir(self.tmp_folder+'/tmp')
 
         command = [binary,
                    'cluster',
-                   self.models_folder+'/seqdb',
-                   self.models_fol<a$der+'/clustering',
-                   self.tmp_folder+'/tmp',
+                   self.tmp_folder+'/seqdb',
+                   self.tmp_folder+'/clustering',
+                   self.tmp_folder,
                    '--cluster-reassign',
                    '1',
                    '--min-seq-id',
@@ -431,23 +524,29 @@ class DataCleaner():
 
         command = [binary,
                    'createtsv',
-                   self.models_folder+'/seqdb',
-                   self.models_folder+'/seqdb',
-                   self.models_folder+'/clustering',
-                   self.cluster_path]
+                   self.tmp_folder+'/seqdb',
+                   self.tmp_folder+'/seqdb',
+                   self.tmp_folder+'/clustering',
+                   target_folder+'/'+output_name]
         sp.run(command)
 
-        for path in glob.glob(self.models_folder+'/clustering.*'):
-            os.remove(path)
-        shutil.rmtree(self.models_folder+'/tmp')
+        for path in glob.glob(self.tmp_folder+'/*'):
+            try: os.remove(path)
+            except: shutil.rmtree(path)
+
 
 
 
 def main():
 
-    DC = DataCleaner(sys.argv[1], sys.argv[2], /home/gabriele/)
-    DC.uniprot_mapping(sys.argv[3])
-    DC.parse_seqres(sys.argv[4])
+    DC = DataCleaner(sys.argv[1], sys.argv[2], '/home/gabriele/tmp/')
+    #DC.uniprot_mapping(sys.argv[3])
+
+    seqres = DC.load_seqres()
+    all_pdb = [pdb for pdb in seqres]
+
+    
+
 
 #    sasa = ShrakeRupley()
 #    cid = chains[0].get_id()
