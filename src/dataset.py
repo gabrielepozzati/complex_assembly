@@ -22,7 +22,7 @@ from Bio.PDB.PDBParser import PDBParser
 from Bio.SeqIO.PdbIO import PdbSeqresIterator
 from Bio.SeqIO.PdbIO import CifSeqresIterator
 
-from Bio.PDB.SASA import ShrakeRupley
+#from Bio.PDB.SASA import ShrakeRupley
 from Bio.PDB.Polypeptide import is_aa
 from Bio.PDB.Polypeptide import three_to_one
 
@@ -31,7 +31,7 @@ from Bio.Align import substitution_matrices
 blosum62 = substitution_matrices.load("BLOSUM62")
 
 from itertools import combinations
-from tmtools import tm_align
+#from tmtools import tm_align
 
 import matplotlib.pyplot as plt
 import seaborn as sb
@@ -339,6 +339,7 @@ class DataCleaner():
     def load_seqres(self):
         '''
         load seqres.pkl
+
         '''
 
         #check seqres.pkl exists
@@ -351,202 +352,214 @@ class DataCleaner():
         return seqres
 
 
-    def find_complex_homology(self,
-                              pdb_list,
-                              output_name,
-                              MMbinary=None,
-                              TMbinary=None):
+    def group_fasta(self, 
+                    pdb_list,
+                    output_path,
+                    af_format=False):
         '''
+        group selection of fasta sequences in a single or multiple fasta files
+
         '''
-        
-        seqres = self.load_seqres()
-        for idx, pdb in enumerate(pdb_list):
-            
+
+        if output_path.endswith('.fasta') or af_format:
             all_fasta = ''
-            uniq_seqres = []
-            for chain, seq in seqres[pdb]['seqres'].items():
-                if seq not in uniq_seqres: uniq_seqres.append(seq)
-                else: continue
-                all_fasta += f'>{pdb}_{chain_id}\n{seq}\n'
-            with open(output_name, 'w') as out: out.write(all_fasta)
-
-            command = [binary,
-                       'createdb',
-                       input_data,
-                       self.tmp_folder+'/seqdb']
-            sp.run(command)
-
-            command = [binary,
-                       'search',
-                       self.tmp_folder+'/seqdb',
-                       self.tmp_folder+'/seqdb',
-                       self.tmp_folder+'/seqdb',
-                       self.tmp_folder,
-                       '-a','1','-s',7.5,
-                       '--alignment-mode','3',
-                       '--alignment-output-mode','3']
-
-            command = [binary,
-                   'createtsv',
-                   self.tmp_folder+'/seqdb',
-                   self.tmp_folder+'/seqdb',
-                   self.tmp_folder+'/clustering',
-                   target_folder+'/'+output_name]
-            sp.run(command)
-
-                chain_names.append(f'{pdb}_{chain}.pdb')
-                with open(f'{self.tmp_folder}/{pdb}_{chain}.pdb','w') as out:
-                    for line in open(seqres[pdb]['full_path']):
-                        if line.startswith('ATOM') and line[20:22].strip() == chain:
-                            out.write(line)
-
-            avg_tm = 0
-            comb = list(combinations(chain_names, 2))
-            print (len(comb))
-            if len(comb) == 0: continue
-            for c1, c2 in comb:
-                command = [binary,
-                           f'{self.tmp_folder}/{c1}',
-                           f'{self.tmp_folder}/{c2}']
-                try:
-                    tmalign_out = sp.run(command, capture_output=True, timeout=60)
-                    tmalign_out = tmalign_out.stdout.decode('UTF-8')
-                    TMscore = max([float(line.split()[1]) for line in tmalign_out.split('\n') \
-                                   if line.startswith('TM-score=')])
-                except: continue
-                avg_tm += TMscore
-
-            tmscores.append(avg_tm/len(comb))
-
-            for path in glob.glob(self.tmp_folder+'/*.pdb'):
-                os.remove(path)
-            
-        return tmscores
-
-    def create_str_folder(self, 
-                          pdb_list, 
-                          target_folder):
-        '''
-        copy subset of pdb structures in a single folder
-
-        '''
-
-        if not os.path.exists(target_folder): os.mkdir(target_folder)
+            mode='manyperfasta'
+        else: 
+            if not os.path.exists(output_path): os.mkdir(output_path)
+            mode='oneperfasta'
 
         seqres = self.load_seqres()
         for pdb in pdb_list:
-            command = ['cp',
-                       seqres[pdb]['full_path'],
-                       f'{target_folder}/{pdb}.pdb']
-            sp.run(command)
-
-
-    @progression(label='Fetching fasta')
-    def fetch_str_fasta(self, 
-                        pdb_list, 
-                        target_folder=None, 
-                        target_fasta=None,
-                        from_structure=False):
-        '''
-        fetch sequences of pdb chains and save them in a single folder
-
-        '''
-        if target_folder:
-            if not os.path.exists(target_folder): os.mkdir(target_folder)
-        else:
-            all_fasta = ''
-
-        seqres = self.load_seqres()
-        for idx, pdb in enumerate(pdb_list):
-            if from_structure:
-                seq = ''
-                str_path = seqres[pdb]['full_path']
-                struc = load_structure(str_path, self.pdbp)
-                for model in struc:
-                    for chain in model:
-                        chain_id = chain.get_id()
-                        for res in chain:
-                            res_id = res.get_resname()
-                            if res_id not in standard_residues_three: continue
-                            seq += three_to_one(res_id)
-                        if target_folder:
-                            with open(f'{target_folder}/{pdb}_{chain_id}.fasta', 'w') as out:
-                                out.write(f'>{pdb}_{chain_id}\n{seq}')
-                        else:
-                            all_fasta += f'>{pdb}_{chain_id}\n{seq}\n'
+            for chain_id, seq in seqres[pdb]['seqres'].items():
+                if mode == 'oneperfasta':
+                    with open(f'{output_path}/{pdb}_{chain_id}.fasta', 'w') as out:
+                        out.write(f'>{pdb}_{chain_id}\n{seq}')
+                else:
+                    all_fasta += f'>{pdb}_{chain_id}\n{seq}\n'
             
-            else:
-                for chain_id, seq in seqres[pdb]['seqres'].items():
-                    if target_folder:
-                        with open(f'{target_folder}/{pdb}_{chain_id}.fasta', 'w') as out:
-                            out.write(f'>{pdb}_{chain_id}\n{seq}')
-                    else:
-                        all_fasta += f'>{pdb}_{chain_id}\n{seq}\n'
+            if af_format:
+                pdb_output_path = f'{output_path}/{pdb}.fasta'
+                with open(pdb_output_path, 'w') as out: out.write(all_fasta)
+                all_fasta = ''
+
+        if mode == 'manyperfasta' and not af_format:
+            with open(output_path, 'w') as out: out.write(all_fasta) 
 
 
-            actual = int((float(idx+1)/len(pdb_list))*100)
-            progression = '# {}% done! '.format(actual)
-            yield progression
-
-        if target_fasta:
-            with open(target_fasta, 'w') as out: out.write(all_fasta)
-
-
-    def mmseq_clustering(self, 
-                         binary, 
-                         target_folder,
-                         input_fasta=None,
-                         output_name='clusters.tsv',
-                         thr='0.9'):
+    def chain_similarity(self,
+                         binary,
+                         input_path):
         '''
-        launch mmseq to cluster fasta seqs contained in a single folder
+        run mmseq2/foldseek comparing all vs all chains in a complex/set of complexes
 
         '''
-        if input_fasta: input_data = input_fasta
-        elif input_folder: input_data = input_folder
 
-        command = [binary,
-                   'createdb',
-                   input_data,
-                   self.tmp_folder+'/seqdb']
+        assert 'mmseqs' in binary or 'foldseek' in binary, \
+            'binary path needs to contain "mmseq" or "foldseek"'
+
+        command = [
+            binary,
+            'createdb',
+            input_path,
+            self.tmp_folder+'/seqdb']
         sp.run(command)
 
-        command = [binary,
-                   'cluster',
-                   self.tmp_folder+'/seqdb',
-                   self.tmp_folder+'/clustering',
-                   self.tmp_folder,
-                   '--cluster-reassign',
-                   '1',
-                   '--min-seq-id',
-                   thr]
-        sp.run(command)
-
-        command = [binary,
-                   'createtsv',
-                   self.tmp_folder+'/seqdb',
-                   self.tmp_folder+'/seqdb',
-                   self.tmp_folder+'/clustering',
-                   target_folder+'/'+output_name]
-        sp.run(command)
+        if 'mmseqs' in binary: self.run_mmseq(binary)
+        elif 'foldseek' in binary: self.run_foldseek(binary)
 
         for path in glob.glob(self.tmp_folder+'/*'):
             try: os.remove(path)
             except: shutil.rmtree(path)
 
+        scores = {}
+        if 'mmseqs' in binary: result_path = self.data_folder+'identities.tsv'
+        elif 'foldseek' in binary: result_path = self.data_folder+'tmscores.tsv'
+        for line in open(result_path):
+            line = line.strip()
+            if line == '': continue
+
+            pdb1 = line.split()[0][:4]
+            c1 = line.split()[0].split('_')[1]
+            
+            pdb2 = line.split()[1][:4]
+            c2 = line.split()[1].split('_')[1]
+            score = float(line.split()[2])
+            
+            scores[pdb1] = scores.get(pdb1, {})
+            scores[pdb1][c1] = scores[pdb1].get(c1, {})
+            scores[pdb1][c1][pdb2] = scores[pdb1][c1].get(pdb2, {})
+            scores[pdb1][c1][pdb2][c2] = score
+
+        return scores
+
+
+    def run_mmseq(self, 
+                  binary,
+                  cov='0.5',
+                  seqid='0.0'):
+
+        command = [
+                binary,
+                'map',
+                self.tmp_folder+'/seqdb',
+                self.tmp_folder+'/seqdb',
+                self.tmp_folder+'/aln',
+                self.tmp_folder, '-a',
+                '--min-seq-id', seqid,
+                '-c', cov]
+        sp.run(command)
+
+        command = [
+            binary,
+            'convertalis',
+            self.tmp_folder+'seqdb',
+            self.tmp_folder+'seqdb',
+            self.tmp_folder+'aln',
+            self.data_folder+'identities.tsv',
+            '--format-output',
+            'query,target,pident']
+        sp.run(command)
+
+
+    def run_foldseek(self, binary):
+
+        command = [
+            binary,
+            'search',
+            self.tmp_folder+'/seqdb',
+            self.tmp_folder+'/seqdb',
+            self.tmp_folder+'/aln',
+            self.tmp_folder, '-a']
+        sp.run(command)
+
+        command = [
+            binary,
+            'aln2tmscore',
+            self.tmp_folder+'/seqdb',
+            self.tmp_folder+'/seqdb',
+            self.tmp_folder+'/aln',
+            self.tmp_folder+'/aln_tmscore']
+        sp.run(command)
+
+        command = [
+            binary,
+            'createtsv',
+            self.tmp_folder+'/seqdb',
+            self.tmp_folder+'/seqdb',
+            self.tmp_folder+'/aln_tmscore',
+            self.data_folder+'/tmscores.tsv']
+        sp.run(command)
 
 
 
 def main():
-
-    DC = DataCleaner(sys.argv[1], sys.argv[2], '/home/gabriele/tmp/')
-    #DC.uniprot_mapping(sys.argv[3])
-
-    seqres = DC.load_seqres()
-    all_pdb = [pdb for pdb in seqres]
-
+    mmseq_bin = '/proj/nobackup/snic2019-35-62/gpozzati/programs/mmseqs'
+    foldseek_bin = '/proj/nobackup/snic2019-35-62/gpozzati/programs/foldseek'
+    database_path = '/proj/nobackup/snic2019-35-62/Database/pdb_mmcif/pdb_mmcif'
     
+    DC = DataCleaner('/proj/nobackup/snic2019-35-62/gpozzati/complex_assembly/data/multimers',
+                     '/proj/nobackup/snic2019-35-62/gpozzati/complex_assembly/data/',
+                     '/proj/nobackup/snic2019-35-62/gpozzati/tmp/')
+    
+    seqres = DC.load_seqres()
+    pdb_list = list(seqres.keys())
+    DC.group_fasta(pdb_list, DC.tmp_folder+'/all.fasta')
 
+    identities = DC.chain_similarity(mmseq_bin, DC.tmp_folder+'/all.fasta')
+
+    multimeric_state = {}
+    for pdb in pdb_list:
+        stop = False
+        for chain1 in seqres[pdb]['seqres']:
+            for chain2 in identities[pdb][chain1][pdb]:
+                if identities[pdb][chain1][pdb][chain2] < 90:
+                    multimeric_state[pdb] = 'het'
+                    stop = True
+                    break
+            if stop: break
+        if not stop: multimeric_state[pdb] = 'hom'
+
+    het_folder = DC.data_folder+'/heteromers/' 
+    if not os.path.exists(het_folder): os.mkdir(het_folder)
+
+    het_list = []
+    for pdb in pdb_list:
+        if multimeric_state[pdb] == 'hom': continue
+        pdb_path = f'{database_path}/{pdb}.cif'
+        if not os.path.exists(pdb_path): 
+            print (pdb_path,'not found!')
+            continue
+        shutil.copy(pdb_path, het_folder)
+        het_list.append(pdb)
+
+    with open(DC.data_folder+'/hetero_list','w') as out:
+        for pdb in het_list: out.write(pdb+'\n')
+
+    chain_dist = []
+    innerhom_list = []
+    tmscores = DC.chain_similarity(foldseek_bin, het_folder)
+    for pdb in het_list:
+        if pdb not in tmscores: continue
+        for chain1 in tmscores[pdb]:
+            for chain2 in tmscores[pdb][chain1][pdb]:
+                if tmscores[pdb][chain1][pdb][chain2] > 0.6:
+                    innerhom_list.append(pdb)
+                    chain_dist.append(seqres[pdb]['chain_num'])
+                    stop = True
+                    break
+            if stop: break
+    
+    with open(DC.data_folder+'/innerhom_list','w') as out:
+        for pdb in innerhom_list: out.write(pdb+'\n')
+
+    innerhom_folder = DC.data_folder+'/innerhom_fasta/'
+    if not os.path.exists(innerhom_folder): os.mkdir(innerhom_folder)
+    DC.group_fasta(innerhom_list, innerhom_folder, af_format=True)
+
+    sb.distplot(chain_dist, kde=False, bins=range(0,101))
+    plt.xlim(0,100)
+
+    plt.savefig('chain_number_dist.png')
 
 #    sasa = ShrakeRupley()
 #    cid = chains[0].get_id()
