@@ -2,7 +2,7 @@
 #SBATCH -A berzelius-2021-64
 #SBATCH --output=/proj/berzelius-2021-29/users/x_gabpo/job_out/AF%j.out
 #SBATCH --error=/proj/berzelius-2021-29/users/x_gabpo/job_err/AF%j.err
-#SBATCH --array=1-216
+#SBATCH --array=1-217
 #SBATCH --gpus=1
 #SBATCH -t 12:00:00
 

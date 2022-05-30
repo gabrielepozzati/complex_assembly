@@ -19,10 +19,12 @@ def fasta_combinations(chain_number, af_out_folder):
     sets = itertools.combinations_with_replacement(chains, chain_number)
     for idx, chain_set in enumerate(sets):
         idx += 1
+        if len(set(chain_set)) != 1: continue
         with open(f'{af_out_folder}/{pdb}_{idx}.fasta', 'w') as out:
-            for chain in chain_set:
-                out.write('>'+mapping_dict[chain]['description']+'\n')
-                out.write(mapping_dict[chain]['sequence']+'\n')
+            for subidx, chain in enumerate(chain_set):
+                out.write(f'>{mapping_dict[chain]["description"]}\n')
+                out.write(f'{mapping_dict[chain]["sequence"]}\n')
+
 
 def main():
     fasta_combinations(2, sys.argv[1]) 
