@@ -98,8 +98,11 @@ class AFDockingQuality():
 #######################################
 
     def derive_ground_truth(self, chain1, chain2):
-        best_chain = 
+        
         for chain in self.chain_map[chain1]:
+            interfaces = get_interfaces(self.structure, chain)
+            if chain
+
 
         
 
@@ -200,6 +203,15 @@ class AFDockingQuality():
         alignment = align.globalds(sequence1, sequence2, blosum62, -11, -1)
         return alignment[0]
 ###########################
+
+
+def superpose(structure1, structure2):
+    superpose_structure = Bio.PDB.Superimposer()
+    superpose_structure.set_atoms(structure1, structure2)
+    superpose_structure.apply(structure1)
+    return superpose_structure
+##############################
+
 
     def map_structures(self):
         for dock_id, chains in self.chain_map.items():
