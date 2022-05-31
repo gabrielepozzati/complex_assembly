@@ -21,7 +21,7 @@ from Bio.PDB.MMCIFParser import MMCIFParser
 from Bio.PDB.PDBParser import PDBParser
 from Bio.SeqIO.PdbIO import PdbSeqresIterator
 from Bio.SeqIO.PdbIO import CifSeqresIterator
-
+from Bio.PDB.NeighborSearch import NeighborSearch
 #from Bio.PDB.SASA import ShrakeRupley
 from Bio.PDB.Polypeptide import is_aa
 from Bio.PDB.Polypeptide import three_to_one
@@ -40,11 +40,11 @@ standard_three = ['ALA', 'ARG', 'ASN', 'ASP',
                   'THR', 'TRP', 'TYR', 'VAL']
 
 
-class SubDockingQuality():
+class AFDockingQuality():
     def __init__(self, data_folder, tmp_folder):
         self.data_folder = data_folder
         self.tmp_folder = tmp_folder
-
+####################################
 
     def setup_chains(self, binary, structure, docking):
         self.docking = docking
@@ -54,7 +54,9 @@ class SubDockingQuality():
         # in the docking and original complexes
         self.str_dic = self.get_sequences(self.structure)
         self.dock_dic = self.get_sequences(self.docking)
+########################################################
 
+    def map_docking_to_structure(self, binary):
         # run mmseq to map all docking chains vs all true structure chains
         self.write_sequences(self.str_dic, self.tmp_folder+'/structure.fasta')
         self.write_sequences(self.dock_dic, self.tmp_folder+'/docking.fasta')
@@ -64,12 +66,14 @@ class SubDockingQuality():
 
         # parse mmseq output
         chain_map = {}
+        all_identities = []
         with open(alignment_path) as align:
             best_identity = 0
             for line in align:
                 ch_dock, ch_str, identity = line.split('\t')
                 identity = float(identity)
-                
+                all_identities.append([ch_dock, ch_str, identity])
+
                 if ch_dock not in chain_map: 
                     best_identity = 0
                     str_chains = []
@@ -81,12 +85,23 @@ class SubDockingQuality():
                     str_chains.append(ch_str)
                     chain_map[ch_dock] = list(str_chains)
         
-        # modify residue numbering in structure to match docking
-        self.map_structures(chain_map)
+        self.chain_map = chain_map
+        self.all_identities = all_identities
 
+        # modify residue numbering in structure to match docking
+        self.map_structures()
+
+        # clean up tmp directory
         for path in glob.glob(self.tmp_folder+'/*'):
             try: os.remove(path)
             except: shutil.rmtree(path)
+#######################################
+
+    def derive_ground_truth(self, chain1, chain2):
+        best_chain = 
+        for chain in self.chain_map[chain1]:
+
+        
 
 
     def get_sequences(self, struc):
@@ -95,19 +110,46 @@ class SubDockingQuality():
             seq = ''
             for res in chain:
                 if res.get_id()[0] != ' ': continue
-                if res.get_resname() in standard_three: 
+                if res.get_resname() in standard_three:
                     seq += three_to_one(res.get_resname())
                 else: seq += 'X'
 
             seq_dic[chain.get_id()] = seq
         return seq_dic
+######################
 
+    def get_chain_residues(self, structure, chain_id):
+        for chain in unfold_entities(structure, 'C'):
+            if chain.get_id() == chain_id:
+                return unfold_entities(chain, 'R')
+##################################################
+
+    def get_interfaces(self, structure, chain_id):
+        res_receptor = get_chain_residues(structure, chain_id)
+
+        interface_dic = {}
+        for chain in unfold_entities(structure, 'C')
+            interface = set()
+            if chain.get_id() == chain_id: continue
+            ligand_atom_list += [list(atom.get_coord()) \
+                for atom in unfold_entities(chain, 'A')]
+            ns = NeighborSearch(ligand_atom_list)
+            for residue in res_receptor:
+                interf = False
+                for atom in unfold_entities(residue, 'A'):
+                    n = ns.search(atom.get_coords(), 6, level='R')
+                    if len(n) != 0: 
+                        interface.add(residue.get_id()[1])
+                        break
+            interface_dic[chain.get_id()] = interface
+        return interface_dic
+############################
 
     def write_sequences(self, seq_dic, out_path):
         with open(out_path, 'w') as out:
             for key, seq in seq_dic.items():
-                out.write(f'>{key}\n{seq}\n')
-
+                out.write(f'>{key}\n{seq}\n'
+############################################
 
     def format_mmseqdb(self, binary, input_path):
         output_path = input_path.split('.')[0]+'.db'
@@ -119,7 +161,7 @@ class SubDockingQuality():
         sp.run(command, stdout=sp.DEVNULL)
 
         return output_path
-
+##########################
 
     def run_mmseq(self,
                   binary,
@@ -152,32 +194,18 @@ class SubDockingQuality():
         sp.run(command, stdout=sp.DEVNULL)
 
         return self.tmp_folder+'/alignment.tsv'
-
+###############################################
 
     def align_sequences(self, sequence1, sequence2):
         alignment = align.globalds(sequence1, sequence2, blosum62, -11, -1)
         return alignment[0]
+###########################
 
-
-    def get_residues(self, structure, chain_id):
-        for chain in unfold_entities(structure, 'C'):
-            if chain.get_id() == chain_id: 
-                return unfold_entities(chain, 'R')
-
-
-    def print_residue_id(self, structure, chain_id):
-        for model in structure:
-            for chain in model:
-                if chain.id == chain_id:
-                    for residue in chain:
-                        if residue.get_id()[0] == ' ':
-                            print(residue.id)
-
-    def map_structures(self, chain_map):
-        for dock_id, chains in chain_map.items():
-            dock_res = self.get_residues(self.docking, dock_id)
+    def map_structures(self):
+        for dock_id, chains in self.chain_map.items():
+            dock_res = self.get_chain_residues(self.docking, dock_id)
             for struc_id in chains:
-                struc_res = self.get_residues(self.structure, struc_id)
+                struc_res = self.get_chain_residues(self.structure, struc_id)
                 
                 s1 = self.dock_dic[dock_id]
                 s2 = self.str_dic[struc_id]
