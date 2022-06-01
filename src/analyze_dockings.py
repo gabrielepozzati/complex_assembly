@@ -21,7 +21,9 @@ from Bio.PDB.MMCIFParser import MMCIFParser
 from Bio.PDB.PDBParser import PDBParser
 from Bio.SeqIO.PdbIO import PdbSeqresIterator
 from Bio.SeqIO.PdbIO import CifSeqresIterator
+from Bio.PDB.PDBIO import PDBIO
 from Bio.PDB.NeighborSearch import NeighborSearch
+
 #from Bio.PDB.SASA import ShrakeRupley
 from Bio.PDB.Polypeptide import is_aa
 from Bio.PDB.Polypeptide import three_to_one
@@ -40,13 +42,13 @@ standard_three = ['ALA', 'ARG', 'ASN', 'ASP',
                   'THR', 'TRP', 'TYR', 'VAL']
 
 
-class AFDockingQuality():
+class DockingQualityManager():
     def __init__(self, data_folder, tmp_folder):
         self.data_folder = data_folder
         self.tmp_folder = tmp_folder
 ####################################
 
-    def setup_chains(self, binary, structure, docking):
+    def setup_chains(self, structure, docking):
         self.docking = docking
         self.structure = structure
 
@@ -97,29 +99,35 @@ class AFDockingQuality():
             except: shutil.rmtree(path)
 #######################################
 
+
     def derive_ground_truth(self, chain1, chain2):
         # find interfaces
         relevant_int = []
         for rec_chain in self.chain_map[chain1]:
-            interfaces = get_interfaces(self.structure, rec_chain)
+            interfaces = self.get_chain_interfaces(self.structure, rec_chain)
             for lig_chain, rec_set in interfaces.items():
+                if len(rec_set) == 0: continue
                 if lig_chain in self.chain_map[chain2]:
                     rec_set = set([f'{res}R' for res in rec_set])
-                    lig_set = self.get_interface(structure, lig_chain, rec_chain)
+                    lig_set = self.get_interface(self.structure, lig_chain, rec_chain)
                     lig_set = set([f'{res}L' for res in lig_set])
                     relevant_int.append([rec_chain, lig_chain, rec_set.union(lig_set)])
         
         # sort interface by size 
-        sizes = [len(res_set) for c1, c2, res_set in relevant_int]
-        sizes = np.array(sizes)
-        relevant_int = relevant_int[np.argsort(sizes)[::-1]]
+        sizes = np.array([len(res_set) for c1, c2, res_set in relevant_int])
+        relevant_int = [relevant_int[idx] for idx in np.argsort(sizes)[::-1]]
+        
+        for inter in relevant_int:
+            print (inter)
         
         # find largest interface and remove redundant ones
         nonredunant_int = []
         for c1, c2, set1 in relevant_int:
+            redundant = False
             for c11, c22, set2 in nonredunant_int:
                 common_res = set1.intersection(set2)
-                if len(common_res) >= len(set1)*0.5: continue
+                if len(common_res) >= len(set1)*0.5: redundant = True
+            #if not redundant: nonredunant_int.append([c1, c2, set1])
             nonredunant_int.append([c1, c2, set1])
         return nonredunant_int
 ##############################
@@ -141,7 +149,7 @@ class AFDockingQuality():
     def write_sequences(self, seq_dic, out_path):
         with open(out_path, 'w') as out:
             for key, seq in seq_dic.items():
-                out.write(f'>{key}\n{seq}\n'
+                out.write(f'>{key}\n{seq}\n')
 ############################################
 
     def get_chain_residues(self, structure, chain_id):
@@ -152,7 +160,7 @@ class AFDockingQuality():
 
     def get_chain_interfaces(self, structure, chain_id):
         interface_dic = {}
-        for chain in unfold_entities(structure, 'C')
+        for chain in unfold_entities(structure, 'C'):
             if chain.get_id() == chain_id: continue
             interface = self.get_interface(structure, chain_id, chain.get_id())
             interface_dic[chain.get_id()] = interface
@@ -160,15 +168,16 @@ class AFDockingQuality():
 ############################
 
     def get_interface(self, structure, rec_chain_id, lig_chain_id): 
-        lig_atom_list += [list(atom.get_coord()) \
-            for atom in unfold_entities(lig_chain, 'A')]
-        ns = NeighborSearch(ligand_atom_list)
+        lig_residues = self.get_chain_residues(structure, lig_chain_id)
+        lig_atom_list = [atom for residue in lig_residues for atom in residue]
+        ns = NeighborSearch(lig_atom_list)
         
         interface = set()
-        rec_residues = get_chain_residues(structure, rec_chain)
+        rec_residues = self.get_chain_residues(structure, rec_chain_id)
         for residue in rec_residues:
+            if residue.get_id()[0] != ' ': continue 
             for atom in unfold_entities(residue, 'A'):
-                n = ns.search(atom.get_coords(), 6, level='R')
+                n = ns.search(atom.get_coord(), 6, level='R')
                 if len(n) != 0:
                     interface.add(residue.get_id()[1])
                     break
@@ -252,16 +261,41 @@ class AFDockingQuality():
                     idx += 1
 ############################
 
-    def run_dockq(self):
-        print ('to implement!')
+    def run_dockq(self, dockq_path, target_path):
+        out_manager = PDBIO()
 
+        # get native interaction chains
+        for idx1, drec_chain_id in enumerate(self.chain_map.keys()):
+            for idx2, dlig_chain_id in enumerate(self.chain_map.keys()):
+                if idx1 >= idx2: continue
+                nonredundant_int = self.derive_ground_truth(drec_chain_id, dlig_chain_id)
 
-    def plot_dockqs(self):
-        print ('to implement!')
+                for nrec_chain_id, nlig_chain_id, size in nonredundant_int:
+                    # write down native in TMP matching docking model chain id
+                    native = Structure('native')
+                    native_model = Model(0)
+                    native.add(native_model)
+                    structure_decoy = copy.deepcopy(self.structure)
+                    for chain in unfold_entities(structure_decoy, 'C'):
+                        if chain.get_id() == nrec_chain_id:
+                            chain.detach_parent()
+                            chain.id = drec_chain_id
+                            native[0].add(chain)
+                        if chain.get_id() == nlig_chain_id:
+                            chain.detach_parent()
+                            chain.id = dlig_chain_id
+                            native[0].add(chain)
+                    
+                    out_manager.set_structure(native)
+                    out_manager.save(self.tmp_folder+'native.pdb')
 
-
-    def plot_plddts(self):
-        print ('to implement!')
+                    # run dockq
+                    command = ['python3',
+                               dockq_path,
+                               '-short',
+                               target_path,
+                               self.tmp_folder+'native.pdb']
+                    sp.run(command)
 
 
 
@@ -269,8 +303,10 @@ def main():
     pdbp = PDBParser(QUIET=True)
     cifp = MMCIFParser(QUIET=True)
     mmcifdb = '/proj/berzelius-2021-29/Database/pdb_mmcif/raw/'
+    mmseqs_path = '/proj/berzelius-2021-29/users/x_gabpo/programs/mmseqs/bin/mmseqs'
+    dockq_path = '/proj/berzelius-2021-29/users/x_gabpo/programs/DockQ/DockQ.py'
 
-    SDQ = SubDockingQuality(
+    DQM = DockingQualityManager(
         '/proj/berzelius-2021-29/users/x_gabpo/complex_assembly/data/innerhom_fasta/',
         '/proj/berzelius-2021-29/users/x_gabpo/tmp/')
     
@@ -279,14 +315,14 @@ def main():
         structure_path = mmcifdb+pdb+'.cif'
         structure = cifp.get_structure('', structure_path)
         
-        target_path = f'{SDQ.data_folder}/{pdb}/{pdb}_*/ranked_0.pdb'
+        target_path = f'{DQM.data_folder}/{pdb}/{pdb}_*/ranked_0.pdb'
         for docking_path in glob.glob(target_path):
             docking = pdbp.get_structure('', docking_path)
             
-            SDQ.setup_chains(
-                '/proj/berzelius-2021-29/users/x_gabpo/mmseqs/bin/mmseqs',
-                structure,
-                docking)
+            DQM.setup_chains(structure, docking)
+            DQM.map_docking_to_structure(mmseqs_path)
+            dockq = DQM.run_dockq(dockq_path, docking_path)
+
             break
         
 
