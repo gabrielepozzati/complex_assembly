@@ -99,33 +99,34 @@ class AFDockingQuality():
 
     def derive_ground_truth(self, chain1, chain2):
         # find interfaces
-        match_interfaces = []
+        relevant_int = []
         for rec_chain in self.chain_map[chain1]:
             interfaces = get_interfaces(self.structure, rec_chain)
-            for lig_chain, res_set in interfaces.items():
+            for lig_chain, rec_set in interfaces.items():
                 if lig_chain in self.chain_map[chain2]:
-                    match_interfaces.append([rec_chain, lig_chain, res_set])
+                    rec_set = set([f'{res}R' for res in rec_set])
+                    lig_set = self.get_interface(structure, lig_chain, rec_chain)
+                    lig_set = set([f'{res}L' for res in lig_set])
+                    relevant_int.append([rec_chain, lig_chain, rec_set.union(lig_set)])
         
         # sort interface by size 
-        sizes = [len(res_set) for c1, c2, res_set in match_interfaces]
+        sizes = [len(res_set) for c1, c2, res_set in relevant_int]
         sizes = np.array(sizes)
-        match_interfaces = match_interfaces[np.argsort(sizes)[::-1]]
+        relevant_int = relevant_int[np.argsort(sizes)[::-1]]
         
         # find largest interface and remove redundant ones
-        non_redunant_match = []
-        for c1, c2, set1 in match_interfaces:
-            for c11, c22, set2 in non_redunant_match:
+        nonredunant_int = []
+        for c1, c2, set1 in relevant_int:
+            for c11, c22, set2 in nonredunant_int:
                 common_res = set1.intersection(set2)
                 if len(common_res) >= len(set1)*0.5: continue
-            non_redunant_match.append([c1, c2, set1])
-        return non_redunant_match
+            nonredunant_int.append([c1, c2, set1])
+        return nonredunant_int
+##############################
 
-        
-
-
-    def get_sequences(self, struc):
+    def get_sequences(self, structure):
         seq_dic = {}
-        for chain in unfold_entities(struc, 'C'):
+        for chain in unfold_entities(structure, 'C'):
             seq = ''
             for res in chain:
                 if res.get_id()[0] != ' ': continue
@@ -137,38 +138,42 @@ class AFDockingQuality():
         return seq_dic
 ######################
 
+    def write_sequences(self, seq_dic, out_path):
+        with open(out_path, 'w') as out:
+            for key, seq in seq_dic.items():
+                out.write(f'>{key}\n{seq}\n'
+############################################
+
     def get_chain_residues(self, structure, chain_id):
         for chain in unfold_entities(structure, 'C'):
             if chain.get_id() == chain_id:
                 return unfold_entities(chain, 'R')
 ##################################################
 
-    def get_interfaces(self, structure, chain_id):
-        res_receptor = get_chain_residues(structure, chain_id)
-
+    def get_chain_interfaces(self, structure, chain_id):
         interface_dic = {}
         for chain in unfold_entities(structure, 'C')
-            interface = set()
             if chain.get_id() == chain_id: continue
-            ligand_atom_list += [list(atom.get_coord()) \
-                for atom in unfold_entities(chain, 'A')]
-            ns = NeighborSearch(ligand_atom_list)
-            for residue in res_receptor:
-                interf = False
-                for atom in unfold_entities(residue, 'A'):
-                    n = ns.search(atom.get_coords(), 6, level='R')
-                    if len(n) != 0: 
-                        interface.add(residue.get_id()[1])
-                        break
+            interface = self.get_interface(structure, chain_id, chain.get_id())
             interface_dic[chain.get_id()] = interface
         return interface_dic
 ############################
 
-    def write_sequences(self, seq_dic, out_path):
-        with open(out_path, 'w') as out:
-            for key, seq in seq_dic.items():
-                out.write(f'>{key}\n{seq}\n'
-############################################
+    def get_interface(self, structure, rec_chain_id, lig_chain_id): 
+        lig_atom_list += [list(atom.get_coord()) \
+            for atom in unfold_entities(lig_chain, 'A')]
+        ns = NeighborSearch(ligand_atom_list)
+        
+        interface = set()
+        rec_residues = get_chain_residues(structure, rec_chain)
+        for residue in rec_residues:
+            for atom in unfold_entities(residue, 'A'):
+                n = ns.search(atom.get_coords(), 6, level='R')
+                if len(n) != 0:
+                    interface.add(residue.get_id()[1])
+                    break
+        return interface
+########################
 
     def format_mmseqdb(self, binary, input_path):
         output_path = input_path.split('.')[0]+'.db'
@@ -220,14 +225,12 @@ class AFDockingQuality():
         return alignment[0]
 ###########################
 
-
-def superpose(structure1, structure2):
-    superpose_structure = Bio.PDB.Superimposer()
-    superpose_structure.set_atoms(structure1, structure2)
-    superpose_structure.apply(structure1)
-    return superpose_structure
+    def superpose(structure1, structure2):
+        superpose_structure = Bio.PDB.Superimposer()
+        superpose_structure.set_atoms(structure1, structure2)
+        superpose_structure.apply(structure1)
+        return superpose_structure
 ##############################
-
 
     def map_structures(self):
         for dock_id, chains in self.chain_map.items():
@@ -247,6 +250,7 @@ def superpose(structure1, structure2):
                         struc_res[idx].detach_parent()
                         continue
                     idx += 1
+############################
 
     def run_dockq(self):
         print ('to implement!')
