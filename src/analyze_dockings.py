@@ -98,11 +98,27 @@ class AFDockingQuality():
 #######################################
 
     def derive_ground_truth(self, chain1, chain2):
+        # find interfaces
+        match_interfaces = []
+        for rec_chain in self.chain_map[chain1]:
+            interfaces = get_interfaces(self.structure, rec_chain)
+            for lig_chain, res_set in interfaces.items():
+                if lig_chain in self.chain_map[chain2]:
+                    match_interfaces.append([rec_chain, lig_chain, res_set])
         
-        for chain in self.chain_map[chain1]:
-            interfaces = get_interfaces(self.structure, chain)
-            if chain
-
+        # sort interface by size 
+        sizes = [len(res_set) for c1, c2, res_set in match_interfaces]
+        sizes = np.array(sizes)
+        match_interfaces = match_interfaces[np.argsort(sizes)[::-1]]
+        
+        # find largest interface and remove redundant ones
+        non_redunant_match = []
+        for c1, c2, set1 in match_interfaces:
+            for c11, c22, set2 in non_redunant_match:
+                common_res = set1.intersection(set2)
+                if len(common_res) >= len(set1)*0.5: continue
+            non_redunant_match.append([c1, c2, set1])
+        return non_redunant_match
 
         
 
