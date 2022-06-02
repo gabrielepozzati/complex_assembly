@@ -247,21 +247,32 @@ class DockingQualityManager():
     def map_structures(self):
         for dock_id, chains in self.chain_map.items():
             dock_res = self.get_chain_residues(self.docking, dock_id)
+
             for struc_id in chains:
                 struc_res = self.get_chain_residues(self.structure, struc_id)
-                
+
                 s1 = self.dock_dic[dock_id]
                 s2 = self.str_dic[struc_id]
                 align = self.align_sequences(s1, s2)
                 
-                idx = 0
+                didx = 0
+                sidx = 0
+                model = struc_res[0].get_full_id()[1]
+                for res in struc_res: 
+                    res.detach_parent()
+                    self.structure[model][struc_id].detach_child(res.id)
+
                 for res1, res2 in zip(align[0], align[1]):
                     if res1 != '-' and res2 != '-':
-                        struc_res[idx].id = dock_res[idx].id
+                        struc_res[sidx].id = dock_res[didx].id
+                        self.structure[model][struc_id].add(struc_res[sidx])
+                        didx += 1
+                        sidx += 1
+                    elif res2 == '-':
+                        didx += 1
                     elif res1 == '-':
-                        struc_res[idx].detach_parent()
-                        continue
-                    idx += 1
+                        sidx += 1
+
 ############################
 
     def get_pdockq(self, struc):
@@ -271,7 +282,8 @@ class DockingQualityManager():
 
         plddts = [rec[idx]['CA'].get_bfactor() for idx in rec_res]
         plddts += [lig[idx]['CA'].get_bfactor() for idx in lig_res]
-        IF_plddt = sum(plddts)/len(plddts)
+        if plddts != []: IF_plddt = sum(plddts)/len(plddts)
+        else: IF_plddt = 0.0
         x = np.log(len(plddts)+1.e-20)*IF_plddt
 
         L = 7.07140240e-01
@@ -343,29 +355,31 @@ class DockingQualityManager():
 def main():
     pdbp = PDBParser(QUIET=True)
     cifp = MMCIFParser(QUIET=True)
-    mmcifdb = '/proj/berzelius-2021-29/Database/pdb_mmcif/raw/'
-    mmseqs_path = '/proj/berzelius-2021-29/users/x_gabpo/programs/mmseqs/bin/mmseqs'
-    dockq_path = '/proj/berzelius-2021-29/users/x_gabpo/programs/DockQ/DockQ.py'
-
+    mmcifdb = '/storage/complex_assembly/data/subdb'
+    mmseqs_path = '/home/gabriele/Desktop/programs/mmseqs/bin/mmseqs'
+    dockq_path = '/home/gabriele/Desktop/programs/DockQ/DockQ.py'
+    
     pdb = sys.argv[1]
+    tmp_folder = f'/home/gabriele/Desktop/tmp/tmp_{pdb}/'
 
     DQM = DockingQualityManager(
-        '/proj/berzelius-2021-29/users/x_gabpo/complex_assembly/data/innerhom_fasta/',
-        f'/proj/berzelius-2021-29/users/x_gabpo/tmp/tmp_{pdb}/')
+        '/storage/complex_assembly/data/innerhom_fasta/',
+        tmp_folder)
+
+    if not os.path.exists(tmp_folder): os.mkdir(tmp_folder)
     
-    output_path = f'/proj/berzelius-2021-29/users/x_gabpo/complex_assembly/data/innerhom_fasta/{pdb}/{pdb}_results.csv'
+    output_path = f'{tmp_folder}/../{pdb}_results.csv'
     with open(output_path, 'w') as outfile:
         outfile.write(f'PDB,Chain1,Chain2,Model,seqID,IFsize,IFplddt,dockq,pdockq\n')
 
-    structure_path = mmcifdb+pdb+'.cif'
+    structure_path = f'{mmcifdb}/{pdb}.cif'
     structure = cifp.get_structure('', structure_path)
     
-    pdb = sys.argv[1]
     target_path = f'{DQM.data_folder}/{pdb}/{pdb}_*/'
     for docking_folder in glob.glob(target_path):
-        for n in range(5):
-                
+        for n in range(5):       
             docking_path = f'{docking_folder}/ranked_{n}.pdb'
+            print (docking_path)
             if not os.path.exists(docking_path): continue
             docking = pdbp.get_structure('', docking_path)
             
@@ -374,17 +388,18 @@ def main():
             
             dockq, [chain1, chain2] = DQM.get_dockq(dockq_path, docking_path)
                 
-            if chain1 is not None:
-                seq1 = DQM.str_dic[chain1]
-                seq2 = DQM.str_dic[chain2]
-                seq_id = DQM.seq_identity(DQM.align_sequences(seq1, seq2))
-                seq_id = round(seq_id, 3)
-            else: seq_id = None
+            rec, lig = unfold_entities(DQM.docking, 'C')
+            seq1 = DQM.dock_dic[rec.get_id()]
+            seq2 = DQM.dock_dic[lig.get_id()]
+            seq_id = DQM.seq_identity(DQM.align_sequences(seq1, seq2))
+            seq_id = round(seq_id, 3)
 
             pdockq, if_plddt, if_size = DQM.get_pdockq(DQM.docking)
-                
+            
+            docking_suffix = docking_folder.split('/')[-2]
+            print (docking_suffix,chain1,chain2,n,seq_id,if_size,round(if_plddt,3),dockq,round(pdockq,3))
             with open(output_path, 'a') as outfile:
-                outfile.write(f'{pdb},{chain1},{chain2},ranked_{n},'\
+                outfile.write(f'{docking_suffix},{chain1},{chain2},ranked_{n},'\
                               f'{seq_id},{if_size},'\
                               f'{round(if_plddt,3)},{dockq},'\
                               f'{round(pdockq,3)}\n')
