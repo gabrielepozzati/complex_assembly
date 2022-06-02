@@ -99,7 +99,6 @@ class DockingQualityManager():
             except: shutil.rmtree(path)
 #######################################
 
-
     def derive_ground_truth(self, chain1, chain2):
         # find interfaces
         relevant_int = []
@@ -116,9 +115,6 @@ class DockingQualityManager():
         # sort interface by size 
         sizes = np.array([len(res_set) for c1, c2, res_set in relevant_int])
         relevant_int = [relevant_int[idx] for idx in np.argsort(sizes)[::-1]]
-        
-        for inter in relevant_int:
-            print (inter)
         
         # find largest interface and remove redundant ones
         nonredunant_int = []
@@ -169,7 +165,8 @@ class DockingQualityManager():
 
     def get_interface(self, structure, rec_chain_id, lig_chain_id): 
         lig_residues = self.get_chain_residues(structure, lig_chain_id)
-        lig_atom_list = [atom for residue in lig_residues for atom in residue]
+        lig_atom_list = [atom for residue in lig_residues for atom in residue \
+                         if atom.get_id() == 'CA']
         ns = NeighborSearch(lig_atom_list)
         
         interface = set()
@@ -177,10 +174,10 @@ class DockingQualityManager():
         for residue in rec_residues:
             if residue.get_id()[0] != ' ': continue 
             for atom in unfold_entities(residue, 'A'):
-                n = ns.search(atom.get_coord(), 6, level='R')
-                if len(n) != 0:
-                    interface.add(residue.get_id()[1])
-                    break
+                if atom.get_id() != 'CA': continue
+                n = ns.search(atom.get_coord(), 10, level='R')
+                if len(n) != 0: interface.add(residue.get_id()[1])
+
         return interface
 ########################
 
@@ -234,6 +231,12 @@ class DockingQualityManager():
         return alignment[0]
 ###########################
 
+    def seq_identity(self, alignment):
+        acc = 0.0
+        for res1, res2 in zip(alignment[0], alignment[1]):
+            if res1==res2: acc += 1
+        return acc/len(alignment[0])
+
     def superpose(structure1, structure2):
         superpose_structure = Bio.PDB.Superimposer()
         superpose_structure.set_atoms(structure1, structure2)
@@ -255,21 +258,43 @@ class DockingQualityManager():
                 for res1, res2 in zip(align[0], align[1]):
                     if res1 != '-' and res2 != '-':
                         struc_res[idx].id = dock_res[idx].id
-                    elif r1 == '-':
+                    elif res1 == '-':
                         struc_res[idx].detach_parent()
                         continue
                     idx += 1
 ############################
 
-    def run_dockq(self, dockq_path, target_path):
-        out_manager = PDBIO()
+    def get_pdockq(self, struc):
+        rec, lig = unfold_entities(struc, 'C')
+        rec_res = self.get_interface(struc, rec.get_id(), lig.get_id())
+        lig_res = self.get_interface(struc, lig.get_id(), rec.get_id())
 
+        plddts = [rec[idx]['CA'].get_bfactor() for idx in rec_res]
+        plddts += [lig[idx]['CA'].get_bfactor() for idx in lig_res]
+        IF_plddt = sum(plddts)/len(plddts)
+        x = np.log(len(plddts)+1.e-20)*IF_plddt
+
+        L = 7.07140240e-01
+        x0 = 3.88062162e+02
+        k = 3.14767156e-02
+        b = 3.13182907e-02
+
+        pDockQ = L / (1 + np.exp(-k*(x-x0)))+b
+
+        return pDockQ, IF_plddt, len(plddts)
+############################################
+
+    def get_dockq(self, dockq_path, target_path):
+        out_manager = PDBIO()
         # get native interaction chains
         for idx1, drec_chain_id in enumerate(self.chain_map.keys()):
             for idx2, dlig_chain_id in enumerate(self.chain_map.keys()):
                 if idx1 >= idx2: continue
                 nonredundant_int = self.derive_ground_truth(drec_chain_id, dlig_chain_id)
 
+                if len(nonredundant_int) == 0: return None, [None, None]
+
+                max_dockq = 0
                 for nrec_chain_id, nlig_chain_id, size in nonredundant_int:
                     # write down native in TMP matching docking model chain id
                     native = Structure('native')
@@ -281,7 +306,7 @@ class DockingQualityManager():
                             chain.detach_parent()
                             chain.id = drec_chain_id
                             native[0].add(chain)
-                        if chain.get_id() == nlig_chain_id:
+                        elif chain.get_id() == nlig_chain_id:
                             chain.detach_parent()
                             chain.id = dlig_chain_id
                             native[0].add(chain)
@@ -295,8 +320,24 @@ class DockingQualityManager():
                                '-short',
                                target_path,
                                self.tmp_folder+'native.pdb']
-                    sp.run(command)
+                    result = sp.run(command, capture_output=True, text=True)
+                    dockq = float(result.stdout.split()[1])
+                    if dockq >= max_dockq: 
+                        max_dockq = dockq
+                        chain_match = [nrec_chain_id, nlig_chain_id]
+                #        command = [mv, 
+                #                   self.tmp_folder+'native.pdb',
+                #                   self.tmp_folder+'best_native.pdb']
+                #        sp.run(command, stdout=sp.DEVNULL)
 
+                #n = dockq_path[-5]
+                #docking_folder = '/'.join(dockq_path.split('/')[:-1])
+
+                #command = [mv,
+                #           self.tmp_folder+'best_native.pdb',
+                #           '/'.join(dockq_path.split()[:-1]),]
+                #sp.run(command, stdout=sp.DEVNULL)
+                return max_dockq, chain_match
 
 
 def main():
@@ -306,24 +347,47 @@ def main():
     mmseqs_path = '/proj/berzelius-2021-29/users/x_gabpo/programs/mmseqs/bin/mmseqs'
     dockq_path = '/proj/berzelius-2021-29/users/x_gabpo/programs/DockQ/DockQ.py'
 
+    pdb = sys.argv[1]
+
     DQM = DockingQualityManager(
         '/proj/berzelius-2021-29/users/x_gabpo/complex_assembly/data/innerhom_fasta/',
-        '/proj/berzelius-2021-29/users/x_gabpo/tmp/')
+        f'/proj/berzelius-2021-29/users/x_gabpo/tmp/tmp_{pdb}/')
     
-    pdb_list = ['1b33']
-    for pdb in pdb_list:
-        structure_path = mmcifdb+pdb+'.cif'
-        structure = cifp.get_structure('', structure_path)
-        
-        target_path = f'{DQM.data_folder}/{pdb}/{pdb}_*/ranked_0.pdb'
-        for docking_path in glob.glob(target_path):
+    output_path = f'/proj/berzelius-2021-29/users/x_gabpo/complex_assembly/data/innerhom_fasta/{pdb}/{pdb}_results.csv'
+    with open(output_path, 'w') as outfile:
+        outfile.write(f'PDB,Chain1,Chain2,Model,seqID,IFsize,IFplddt,dockq,pdockq\n')
+
+    structure_path = mmcifdb+pdb+'.cif'
+    structure = cifp.get_structure('', structure_path)
+    
+    pdb = sys.argv[1]
+    target_path = f'{DQM.data_folder}/{pdb}/{pdb}_*/'
+    for docking_folder in glob.glob(target_path):
+        for n in range(5):
+                
+            docking_path = f'{docking_folder}/ranked_{n}.pdb'
+            if not os.path.exists(docking_path): continue
             docking = pdbp.get_structure('', docking_path)
             
             DQM.setup_chains(structure, docking)
             DQM.map_docking_to_structure(mmseqs_path)
-            dockq = DQM.run_dockq(dockq_path, docking_path)
+            
+            dockq, [chain1, chain2] = DQM.get_dockq(dockq_path, docking_path)
+                
+            if chain1 is not None:
+                seq1 = DQM.str_dic[chain1]
+                seq2 = DQM.str_dic[chain2]
+                seq_id = DQM.seq_identity(DQM.align_sequences(seq1, seq2))
+                seq_id = round(seq_id, 3)
+            else: seq_id = None
 
-            break
+            pdockq, if_plddt, if_size = DQM.get_pdockq(DQM.docking)
+                
+            with open(output_path, 'a') as outfile:
+                outfile.write(f'{pdb},{chain1},{chain2},ranked_{n},'\
+                              f'{seq_id},{if_size},'\
+                              f'{round(if_plddt,3)},{dockq},'\
+                              f'{round(pdockq,3)}\n')
         
 
 if __name__ == '__main__':
