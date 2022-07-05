@@ -22,7 +22,6 @@ from Bio.PDB.PDBParser import PDBParser
 from Bio.SeqIO.PdbIO import PdbSeqresIterator
 from Bio.SeqIO.PdbIO import CifSeqresIterator
 
-#from Bio.PDB.SASA import ShrakeRupley
 from Bio.PDB.Polypeptide import is_aa
 from Bio.PDB.Polypeptide import three_to_one
 
@@ -115,98 +114,45 @@ def load_structure(path, parser):
 
 
 
-class DataCleaner():
-
+class DatasetManager():
 
     def __init__(self, 
-                 pdblist, 
+                 list_path, 
                  data_folder, 
                  tmp_folder):
 
-        with open(pdblist) as list_file:
-            self.pdblist = [line.strip() for line in list_file]
+        with open(list_path) as list_file:
+            self.pdb_list = [line.strip() for line in list_file]
 
-        self.data_folder = data_folder
         self.tmp_folder = tmp_folder
+        self.data_folder = data_folder
         if not os.path.exists(tmp_folder): os.mkdir(tmp_folder)
         
         self.pdbp = PDBParser(QUIET=True)
         self.cifp = MMCIFParser(QUIET=True)
 
-
-    def uniprot_mapping(self, 
-                        uniprot_path):
-        '''
-        Load a pdb-uniprot mapping in order to allow fast recognition and 
-        exclusion of identical structures
-
-        Input:
-        path to a txt format uniprot dump (Swissprot is enough)
-
-        Output:
-        loads a self.uni_mapping dictionary with a set of uniprot ids for each pdb
-
-        '''
-
-        with open(uniprot_path) as uniprot:
-            entries = ''.join([line for line in uniprot])
-
-        uni_mapping = {}
-        entries = entries.split('//')
-        for entry in entries:
-
-            entry = entry.split('\n')
-            for line in entry:
-
-                if line.startswith('AC   '):
-                    uni_code = line[5:].strip(';').split(';')[0]
-
-                elif line.startswith('DR   PDB;'):
-                    pdb_code = line.split()[2].strip(';').lower()
-                    if pdb_code not in uni_mapping: uni_mapping[pdb_code] = set()
-                    uni_mapping[pdb_code].add(uni_code)
-
-        self.uni_mapping = uni_mapping
-
-    @progression(label='Seqres parsing')
-    def parse_seqres(self,
-                     database_folder):
-        '''
-        Given a local sync of the pdb, find out complexes containing
-        non-standard amino-acid chains (mod.res, DNA, RNA) and structures
-        with less than 2 actual chain structures.
-
-        Input:
-        database_folder - path to the pdb biounits folder sync.
-        Must have the following structure:
-        
-        database_folder/
-            00/
-                100a.pdb1
-                100b.pdb1
-                ...
-            01/
-                101a.pdb1
-                101b.pdb1
-                ...
-            ...
-
-        Output:
-        seqres.pkl containing seqres mappings, chain number and filename 
-        of selected structures
-            
-        faulty.pkl containing lists of omitted structures
-
-        '''
+    def __call__(self,
+                 database_folder,
+                 divided_database=True,
+                 min_chain=2,
+                 max_chain=None,
+                 innerhom=False,
+                 homomer=True,
+                 heteromer=True,
+                 unknown=True,
+                 dna=True):
 
         #compute path list
         path_list = []
         for pdb_code in self.pdblist:
-            for n in range(1,10):
-                pdb_path = f'{database_folder}/{pdb_code[1:3]}/{pdb_code}.pdb{n}'
-                cif_path = f'{database_folder}/{pdb_code[1:3]}/{pdb_code}_assembly{n}.cif'
-                if os.path.exists(pdb_path): path_list.append([pdb_code, pdb_path])
-                elif os.path.exists(cif_path): path_list.append([pdb_code, cif_path])
+            if divided_database: folder = f'{database_folder}/{pdb_code[1:3]}/'
+            else: folder = database_folder
+            pdb_path = f'{folder}/{pdb_code}.pdb1'
+            cif_path = f'{folder}/{pdb_code}_assembly1.cif'
+            cif_path2 = f'{folder}/{pdb_code}.cif'
+            if os.path.exists(pdb_path): path_list.append([pdb_code, pdb_path])
+            elif os.path.exists(cif_path): path_list.append([pdb_code, cif_path])
+            else os.path.exists(cif_path2): path_list.append([pdb_code, cif_path2])
 
         pdb_dict = {} 
         parsed_sets = []
@@ -386,6 +332,25 @@ class DataCleaner():
             with open(output_path, 'w') as out: out.write(all_fasta) 
 
 
+    def uniprot_mapping(self,
+                        codes_list):
+
+        url = 'https://www.uniprot.org/uploadlists/'
+
+        params = {
+            'from': 'PDB_ID',
+            'to': 'ACC',
+            'format': 'tab',
+            'query': codes_list}
+
+        data = urllib.parse.urlencode(params)
+        data = data.encode('utf-8')
+        req = urllib.request.Request(url, data)
+        with urllib.request.urlopen(req) as f:
+        response = f.read()
+        print(response.decode('utf-8'))
+
+
     def chain_similarity(self,
                          binary,
                          input_path):
@@ -431,64 +396,6 @@ class DataCleaner():
             scores[pdb1][c1][pdb2][c2] = score
 
         return scores
-
-
-    def run_mmseq(self, 
-                  binary,
-                  cov='0.5',
-                  seqid='0.0'):
-
-        command = [
-                binary,
-                'map',
-                self.tmp_folder+'/seqdb',
-                self.tmp_folder+'/seqdb',
-                self.tmp_folder+'/aln',
-                self.tmp_folder, '-a',
-                '--min-seq-id', seqid,
-                '-c', cov]
-        sp.run(command)
-
-        command = [
-            binary,
-            'convertalis',
-            self.tmp_folder+'seqdb',
-            self.tmp_folder+'seqdb',
-            self.tmp_folder+'aln',
-            self.data_folder+'identities.tsv',
-            '--format-output',
-            'query,target,pident']
-        sp.run(command)
-
-
-    def run_foldseek(self, binary):
-
-        command = [
-            binary,
-            'search',
-            self.tmp_folder+'/seqdb',
-            self.tmp_folder+'/seqdb',
-            self.tmp_folder+'/aln',
-            self.tmp_folder, '-a']
-        sp.run(command)
-
-        command = [
-            binary,
-            'aln2tmscore',
-            self.tmp_folder+'/seqdb',
-            self.tmp_folder+'/seqdb',
-            self.tmp_folder+'/aln',
-            self.tmp_folder+'/aln_tmscore']
-        sp.run(command)
-
-        command = [
-            binary,
-            'createtsv',
-            self.tmp_folder+'/seqdb',
-            self.tmp_folder+'/seqdb',
-            self.tmp_folder+'/aln_tmscore',
-            self.data_folder+'/tmscores.tsv']
-        sp.run(command)
 
 
 
