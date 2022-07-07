@@ -14,7 +14,7 @@ def initialize_clouds(data: Dict[str, jnp.ndarray],
                       seed: int) -> Dict[str, jnp.ndarray]:
 
     for idx, chain in enumerate(data):
-        rotation = R.random(seed).as_matrix()
+        rotation = R.random(random_state=seed).as_matrix()
         data[chain] = jnp.matmul(rotation, data[chain].transpose()).transpose()
         cm = jnp.sum(data[chain], axis=0)/data[chain].shape[0]
         data[chain] = data[chain] - cm

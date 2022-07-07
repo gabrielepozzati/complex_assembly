@@ -40,12 +40,14 @@ def format_data(pdb_paths: list, out_path: str):
         dataset[pdb] = {
             'chains':{},
             'id_mask':{},
+            'ca_mask':{},
             'surface_mask':{},
             'paths':path}
 
         ## uniq 90% id chains would be better ...
         for chain in unfold_entities(structure, 'C'):
             id_mask = []
+            ca_mask = []
             chain_cloud = []
             surface_mask = []
             cid = chain.get_id()
@@ -62,11 +64,15 @@ def format_data(pdb_paths: list, out_path: str):
                     and atom.sasa != 0.0: surface_mask.append(1)
                     else: surface_mask.append(0)
 
+                    if atom.get_id() == 'CA': ca_mask.append(1)
+                    else: ca_mask.append(0)
+
                     id_mask.append(atom.get_full_id())
                     
             dataset[pdb]['chains'][cid] = jnp.array(chain_cloud, dtype=jnp.float32)
             dataset[pdb]['id_mask'][cid] = id_mask
-            dataset[pdb]['surface_mask'][cid] = surface_mask
+            dataset[pdb]['ca_mask'][cid] = jnp.array(ca_mask, dtype=jnp.float32)
+            dataset[pdb]['surface_mask'][cid] = jnp.array(surface_mask, dtype=jnp.float32)
 
     dataset[pdb]['chains'] = initialize_clouds(dataset[pdb]['chains'], 42)
 

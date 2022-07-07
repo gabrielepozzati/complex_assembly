@@ -1,7 +1,40 @@
 
+import numbers
+import functools
+import haiku as hk
+import numpy as np
+
+import jax
 import jax.numpy as jnp
 from jax import grad, jit, vmap
 from jax import random
+
+from typing import Any, Union, Sequence, Mapping, Optional
+
+TRUNCATED_NORMAL_STDDEV_FACTOR = np.asarray(.87962566103423978,
+                                            dtype=np.float32)
+
+def get_initializer_scale(initializer_name, input_shape):
+  """Get Initializer for weights and scale to multiply activations by."""
+
+  if initializer_name == 'zeros':
+    w_init = hk.initializers.Constant(0.0)
+  else:
+    # fan-in scaling
+    scale = 1.
+    for channel_dim in input_shape:
+      scale /= channel_dim
+    if initializer_name == 'relu':
+      scale *= 2
+
+    noise_scale = scale
+
+    stddev = np.sqrt(noise_scale)
+    # Adjust stddev for truncation.
+    stddev = stddev / TRUNCATED_NORMAL_STDDEV_FACTOR
+    w_init = hk.initializers.TruncatedNormal(mean=0.0, stddev=stddev)
+
+  return w_init
 
 class Linear(hk.Module):
   """Protein folding specific Linear module.
@@ -124,9 +157,11 @@ class MultiHeadAttention(hk.Module):
       value: jnp.ndarray) -> jnp.ndarray:
 
     """Compute (optionally masked) MHA with queries, keys & values."""
+    #print ('Pre', query.shape, key.shape, value.shape)
     query_heads = self._linear_projection(query, self.key_size, "query")
     key_heads = self._linear_projection(key, self.key_size, "key")
     value_heads = self._linear_projection(value, self.value_size, "value")
+    #print ('Post', query_heads.shape, key_heads.shape, value_heads.shape)
 
     attn_logits = jnp.einsum("...thd,...Thd->...htT", query_heads, key_heads)
     sqrt_key_size = np.sqrt(self.key_size).astype(key.dtype)
@@ -137,7 +172,7 @@ class MultiHeadAttention(hk.Module):
     # Concatenate attention matrix of all heads into a single vector.
     attn_vec = jnp.reshape(attn, (*query.shape[:-1], -1))
 
-    return hk.Linear(self.model_size, w_init=self.w_init)(attn_vec)
+    return hk.Linear(self.model_size)(attn_vec)
 
   @hk.transparent
   def _linear_projection(
