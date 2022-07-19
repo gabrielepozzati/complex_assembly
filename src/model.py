@@ -109,25 +109,6 @@ class Linear(hk.Module):
     return output
 
 
-class DenseBlock(hk.Module):
-  """A 2-layer MLP"""
-  def __init__(self,
-      #init_scale: float,
-      widening_factor: int = 4,
-      name: Optional[str] = None):
-    super().__init__(name=name)
-    self._init_scale = init_scale
-    self._widening_factor = widening_factor
-
-  def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-    channels = x.shape[-1]
-    #initializer = hk.initializers.VarianceScaling(self._init_scale)
-    x = Linear(self._widening_factor * channels)(x)
-    x = jax.nn.gelu(x)
-      
-    return Linear(channels)(x)
-
-
 class MultiHeadAttention(hk.Module):
   """Multi-headed attention mechanism.
      As described in the vanilla Transformer paper:
@@ -164,7 +145,7 @@ class MultiHeadAttention(hk.Module):
     #print ('Post', query_heads.shape, key_heads.shape, value_heads.shape)
 
     attn_logits = jnp.einsum("...thd,...Thd->...htT", query_heads, key_heads)
-    sqrt_key_size = np.sqrt(self.key_size).astype(key.dtype)
+    sqrt_key_size = jnp.sqrt(self.key_size).astype(key.dtype)
     attn_logits = attn_logits / sqrt_key_size
 
     attn_weights = jax.nn.softmax(attn_logits)
@@ -184,52 +165,140 @@ class MultiHeadAttention(hk.Module):
     y = Linear(self.num_heads * head_size)(x)
     return y.reshape((*x.shape[:-1], self.num_heads, head_size))
 
-class Transformer(hk.Module):
-    """A transformer stack."""
-    def __init__(self,
-                 num_heads: int,
-                 num_layers: int,
-                 dropout_rate: float,
-                 name: Optional[str] = None):
-        super().__init__(name=name)
-        self._num_layers = num_layers
-        self._num_heads = num_heads
-        self._dropout_rate = dropout_rate
 
-    def __call__(self,
-                 h: jnp.ndarray,
-                 mask: Optional[jnp.ndarray],
-                 is_training: bool) -> jnp.ndarray:
-        """Connects the transformer.
-        Args:
-          h: Inputs, [B, T, H].
-          mask: Padding mask, [B, T].
-          is_training: Whether we're training or not.
-        Returns:
-          Array of shape [B, T, H].
-        """
-        init_scale = 2. / self._num_layers
-        dropout_rate = self._dropout_rate if is_training else 0.
-        for i in range(self._num_layers):
-            h_norm = layer_norm(h, name=f'h{i}_ln_1')
-            h_attn = SelfAttention(
-                num_heads=self._num_heads,
-                key_size=64,
-                w_init_scale=init_scale,
-                name=f'h{i}_attn')(h_norm, mask=mask)
-            h_attn = hk.dropout(hk.next_rng_key(), dropout_rate, h_attn)
-            h = h + h_attn
-            h_norm = layer_norm(h, name=f'h{i}_ln_2')
-            h_dense = DenseBlock(init_scale, name=f'h{i}_mlp')(h_norm)
-            h_dense = hk.dropout(hk.next_rng_key(), dropout_rate, h_dense)
-            h = h + h_dense
-        h = layer_norm(h, name='ln_f')
-        return h
+class TriangleMultiplication(hk.Module):
+  """Triangle multiplication layer ("outgoing" or "incoming").
+  Jumper et al. (2021) Suppl. Alg. 11 "TriangleMultiplicationOutgoing"
+  Jumper et al. (2021) Suppl. Alg. 12 "TriangleMultiplicationIncoming"
+  """
 
-def layer_norm(x: jnp.ndarray, name: Optional[str] = None) -> jnp.ndarray:
-    """Apply a unique LayerNorm to x with default settings."""
-    return hk.LayerNorm(axis=-1,
-                        create_scale=True,
-                        create_offset=True,
-                        name=name)(x)
+  def __init__(self, channels, outgoing=False, name='triangle_multiplication'):
+    super().__init__(name=name)
+    self.channels = channels
+    self.outgoing = outgoing
+
+  def __call__(self, act, mask, is_training=True):
+    """Builds TriangleMultiplication module.
+    Arguments:
+      act: Pair activations, shape [N_res, N_res, c_z]
+      mask: Pair mask, shape [N_res, N_res].
+      is_training: Whether the module is in training mode.
+    Returns:
+      Outputs, same shape/type as act.
+    """
+
+    act = hk.LayerNorm(axis=[-1], create_scale=True, create_offset=True,
+                       name='layer_norm_input')(act)
+    input_act = act
+
+    left_projection = Linear(self.channels, name='left_projection')
+    left_proj_act = mask * left_projection(act)
+
+    right_projection = Linear(self.channels, name='right_projection')
+    right_proj_act = mask * right_projection(act)
+
+    left_gate_values = jax.nn.sigmoid(
+        Linear(self.channels, name='left_gate')(act))
+    right_gate_values = jax.nn.sigmoid(
+        Linear(self.channels, name='right_gate')(act))
+
+    left_proj_act *= left_gate_values
+    right_proj_act *= right_gate_values
+
+    # "Outgoing" edges equation: 'ikc,jkc->ijc'
+    # "Incoming" edges equation: 'kjc,kic->ijc'
+    # Note on the Suppl. Alg. 11 & 12 notation:
+    # For the "outgoing" edges, a = left_proj_act and b = right_proj_act
+    # For the "incoming" edges, it's swapped:
+    #   b = left_proj_act and a = right_proj_act
+    if self.outgoing: 
+        equation = 'ikc,jkc->ijc'
+        act = jnp.einsum(equation, left_proj_act, right_proj_act)
+    else: 
+        equation = 'kjc,kic->ijc'
+        act = jnp.einsum(equation, right_proj_act, left_proj_act)
+
+    act = hk.LayerNorm(axis=[-1], create_scale=True, 
+        create_offset=True, name='center_layer_norm')(act)
+
+    output_channel = int(input_act.shape[-1])
+
+    act = Linear(output_channel, initializer=utils.final_init(gc),
+        name='output_projection')(act)
+
+    gate_values = jax.nn.sigmoid(
+        Linear(output_channel, name='gating_linear')(input_act))
+    act *= gate_values
+
+    return act
+
+
+class TriangleAttention(hk.Module):
+  """Triangle multihead attention."""
+
+  def __init__(self, num_heads, output_dim, name='attention'):
+    super().__init__(name=name)
+
+    self.num_heads = num_heads
+    self.output_dim = output_dim
+
+  def __call__(self, q_data, m_data, bias):
+    """Builds Attention module.
+    Arguments:
+      q_data: A tensor of queries, shape [batch_size, N_queries, q_channels].
+      m_data: A tensor of memories from which the keys and values are
+        projected, shape [batch_size, N_keys, m_channels].
+      bias: A bias for the attention, shape [batch_size, N_queries, N_keys].
+      nonbatched_bias: Shared bias, shape [N_queries, N_keys].
+    Returns:
+      A float32 tensor of shape [batch_size, N_queries, output_dim].
+    """
+    # Default attention
+    q_weights = hk.get_parameter(
+        'query_w', shape=(q_data.shape[-1], self.num_head, self.output_dim),
+        init=glorot_uniform())
+    k_weights = hk.get_parameter(
+        'key_w', shape=(m_data.shape[-1], self.num_head, self.output_dim),
+        init=glorot_uniform())
+    v_weights = hk.get_parameter(
+        'value_w', shape=(m_data.shape[-1], self.num_head, self.output_dim),
+        init=glorot_uniform())
+
+    q = jnp.einsum('bqa,ahc->bqhc', q_data, q_weights) * key_dim**(-0.5)
+    k = jnp.einsum('bka,ahc->bkhc', m_data, k_weights)
+    v = jnp.einsum('bka,ahc->bkhc', m_data, v_weights)
+    logits = jnp.einsum('bqhc,bkhc->bhqk', q, k) + bias
+    if nonbatched_bias is not None:
+      logits += jnp.expand_dims(nonbatched_bias, axis=0)
+    weights = jax.nn.softmax(logits)
+    weighted_avg = jnp.einsum('bhqk,bkhc->bqhc', weights, v)
+
+    # Gate updating
+    gating_weights = hk.get_parameter(
+        'gating_w', shape=(q_data.shape[-1], num_head, value_dim),
+        init=hk.initializers.Constant(0.0))
+    gating_bias = hk.get_parameter(
+        'gating_b',
+        shape=(num_head, value_dim),
+        init=hk.initializers.Constant(1.0))
+
+    gate_values = jnp.einsum('bqc, chv->bqhv', q_data,
+                             gating_weights) + gating_bias
+    
+    gate_values = jax.nn.sigmoid(gate_values)
+
+    # Gate application
+    weighted_avg *= gate_values
+
+    init = glorot_uniform()
+    o_weights = hk.get_parameter(
+        'output_w', shape=(num_head, value_dim, self.output_dim),
+        init=init)
+    o_bias = hk.get_parameter('output_b', shape=(self.output_dim,),
+                              init=hk.initializers.Constant(0.0))
+
+    output = jnp.einsum('bqhc,hco->bqo', weighted_avg, o_weights) + o_bias
+
+    return output
+
 

@@ -11,11 +11,13 @@ import string
 import shutil
 import numpy as np
 import subprocess as sp
+import multiprocessing as mp
 
 from Bio.PDB.Chain import Chain
 from Bio.PDB.Model import Model
 from Bio.PDB.Structure import Structure
 from Bio.PDB.Selection import unfold_entities
+from Bio.PDB.SASA import ShrakeRupley
 
 from Bio.PDB.MMCIFParser import MMCIFParser
 from Bio.PDB.PDBParser import PDBParser
@@ -45,12 +47,14 @@ standard_residues_three = [
 
 def is_chain_valid(chain):
 
+    # check there is some aminoacid
     polypep = False
     for residue in chain:
         if is_aa(residue):
             polypep = True
             break
 
+    # check there is no weird stuff with ATOM record
     for residue in chain:
         if residue.get_id()[0] == ' ' \
         and residue.get_resname() not in standard_residues_three:
@@ -78,6 +82,8 @@ def get_seq_coord(structure):
 
 class TimeoutError(Exception):
     pass
+
+
 
 def timeout(seconds=10, error_message=os.strerror(errno.ETIME)):
     def decorator(func):
@@ -118,7 +124,8 @@ class DatasetManager():
 
     def __init__(self, 
                  list_path, 
-                 data_folder, 
+                 data_folder,
+                 database_folder,
                  tmp_folder):
 
         with open(list_path) as list_file:
@@ -126,139 +133,52 @@ class DatasetManager():
 
         self.tmp_folder = tmp_folder
         self.data_folder = data_folder
+        self.database_folder = database_folder
         if not os.path.exists(tmp_folder): os.mkdir(tmp_folder)
-        
-        self.pdbp = PDBParser(QUIET=True)
         self.cifp = MMCIFParser(QUIET=True)
+        self.sasa = ShrakeRupley()
 
     def __call__(self,
-                 database_folder,
-                 divided_database=True,
                  min_chain=2,
                  max_chain=None,
                  innerhom=False,
                  homomer=True,
                  heteromer=True,
-                 unknown=True,
-                 dna=True):
+                 min_innerhom=None,
+                 excl_nucl=True
+                 excl_unknown_residues=True):
+
+        # check already computed stuff
+        if os.path.exists(self.data_folder+'/seqres.pkl'):
+            with open(self.data_folder+'/seqres.pkl', 'rb') as pkl_file:
+                pdb_dict = pkl.load(pkl_file)
+        else: pdb_dict = {'parsed':[]}
 
         #compute path list
-        path_list = []
+        results = []
+        job_list = []
         for pdb_code in self.pdblist:
-            if divided_database: folder = f'{database_folder}/{pdb_code[1:3]}/'
-            else: folder = database_folder
-            pdb_path = f'{folder}/{pdb_code}.pdb1'
-            cif_path = f'{folder}/{pdb_code}_assembly1.cif'
-            cif_path2 = f'{folder}/{pdb_code}.cif'
-            if os.path.exists(pdb_path): path_list.append([pdb_code, pdb_path])
-            elif os.path.exists(cif_path): path_list.append([pdb_code, cif_path])
-            else os.path.exists(cif_path2): path_list.append([pdb_code, cif_path2])
-
-        pdb_dict = {} 
-        parsed_sets = []
-        faults = {'N':[], 'U':[], 'M':[]}
-        
-        #cycle over paths
-        for path_idx, (pdb_code, str_path) in enumerate(path_list):
-            str_format = str_path.split('.')[-1]
-
-            #compute progression
-            actual = int((float(path_idx+1)/len(path_list))*100)
-            progression = '# {}% done! '.format(actual)
-
-            #check complex is in swissprot and the set of uniprot ids
-            #it contains hasn't been parsed yet
-            if pdb_code in self.uni_mapping: 
-                if self.uni_mapping[pdb_code] in parsed_sets: 
-                    print (progression, str_path, '### Discarded! Redundant')
-                    continue
-
-            #get seqres info from file header
-            with open(str_path) as handle:
-                if 'pdb' in str_format:
-                    seqres = {record.id:str(record.seq)
-                        for record in PdbSeqresIterator(handle)}
-                if 'cif' in str_format:
-                    seqres = {record.id:str(record.seq)
-                        for record in CifSeqresIterator(handle)}
-
-            #load structure
-            if 'pdb' in str_format:
-                struc = load_structure(str_path, self.pdbp)
-            if 'cif' in str_format:
-                struc = load_structure(str_path, self.cifp)
-            if not struc: continue
-
-            #parse structure chains
-            str_chains = []
-            for model in struc:
-                for chain in model:
-                    if is_chain_valid(chain):
-                        str_chains.append(chain.get_id())
-
-            #quality controls
-            valid_assembly = True
-
-            #check seqres is not containing DNA/RNA
-            if valid_assembly:
-                for idx, seq in seqres.items():
-                    vocabulary = set([letter for letter in seq \
-                        if letter in standard_residues or letter == 'U'])
-                    if vocabulary == {'A', 'T', 'C', 'G'} \
-                    or vocabulary == {'A', 'U', 'C', 'G'}:
-                        valid_assembly = False
-                        fault = 'Contains DNA/RNA!'
-                        if pdb_code not in faults['N']:
-                            faults['N'].append(pdb_code)
-                        break
-
-            #check PDB have no sequences with unknown residues
-            if valid_assembly:
-                unknown_residues = False
-                for key, seq in seqres.items():
-                    for residue in seq:
-                        if residue not in standard_residues:
-                            unknown_residues = True
-                            break
-                if unknown_residues:
-                    valid_assembly = False
-                    fault = 'Unknown residues!'
-                    if pdb_code not in faults['U']:
-                        faults['U'].append(pdb_code)
+            if pdb_code in pdb_dict['parsed']: continue
+            cif_path = f'{self.data_folder}/{pdb_code}.cif'
+            job = [pdb_code, cif_path, excl_nucl, excl_unknown_residues]
+            if os.path.exists(cif_path): job_list.append([job])
+            if len(job_list) % 1000 == 0:
+                p = mp.pool(25)
+                results.extend(p.map(self.cleaning_worker, job_list))
+                p.join()
+                job_list = []
 
 
-            #check seqres seqs have corresponding coordinates
-            #and skip assemblies with only one matching seq/str
-            #or containing inconsistencies
-            if valid_assembly:
-                seq_chains = list(seqres.keys())
-                for chain in seq_chains:
-                    if chain not in str_chains: del(seqres[chain])
-                for chain in str_chains:
-                    if chain not in seq_chains: valid_assembly = False
 
-                if len(str_chains) <= 1:
-                    valid_assembly = False
-                    fault = 'Only 1 chain structure or str/seqres mismatch'
-                    if pdb_code not in faults['M']:
-                        faults['M'].append(pdb_code)
-
-            #sum up quality controls
-            if valid_assembly:
-                yield f'{progression} {str_path}'
-            else:
-                yield f'{progression} {str_path} ### Discarded! {fault}'
-                continue
+#        #compute progression
+#            actual = int((float(path_idx+1)/len(path_list))*100)
+#            progression = '# {}% done! '.format(actual)
 
             #store in object data
             pdb_dict[pdb_code] = {}
-            pdb_dict[pdb_code]['chain_num'] = len(str_chains)
             pdb_dict[pdb_code]['seqres'] = copy.deepcopy(seqres)
-            pdb_dict[pdb_code]['full_path'] = str_path
-            if pdb_code in faults['N']: faults['N'].remove(pdb_code)
-            if pdb_code in faults['U']: faults['U'].remove(pdb_code)
-            if pdb_code in faults['M']: faults['M'].remove(pdb_code)
-            if pdb_code in self.uni_mapping: 
+            pdb_dict['parsed'].append(pdb_code)
+            if pdb_code in self.uni_mapping:
                 parsed_sets.append(self.uni_mapping[pdb_code])
 
             #write partial good structures data
@@ -270,16 +190,90 @@ class DatasetManager():
         with open(self.data_folder+'/seqres.pkl', 'wb') as f:
             pickle.dump(pdb_dict, f)
 
-        #write faulty codes
-        with open(self.data_folder+'/faulty.pkl', 'wb') as f:
-            pickle.dump(faults, f)
 
-        #summary
-        print (f'Found:')
-        print (f'{len(pdb_dict)} acceptable structures')
-        print (f'{len(faults["N"])} structures containing nucleic acids')
-        print (f'{len(faults["U"])} structures containing non-standard main sequence residues')
-        print (f'{len(faults["M"])} structures with 1 chain only or str/seqres mismatch')
+
+    def cleaning_worker(self, job):
+        pdb_code = job[0]
+        cif_path = job[1]
+        excl_nucl = job[2]
+        excl_unknown_residues = job[3]
+
+        #check complex is in swissprot and the set of uniprot ids
+        #it contains hasn't been parsed yet
+        if pdb_code in self.uni_mapping: 
+            if self.uni_mapping[pdb_code] in parsed_sets: 
+                return [False, pdb_code, 'Redundant!']
+
+        #get seqres info from file header and structure
+        with open(str_path) as handle:
+            seqres = {record.id:str(record.seq)
+                for record in CifSeqresIterator(handle)}
+
+        struc = load_structure(str_path, self.cifp)
+        if not struc:
+            return [False, pdb_code, 'No structure found!']
+
+        #parse structure chains
+        str_chains = []
+        for model in struc:
+            for chain in model:
+                if is_chain_valid(chain):
+                    str_chains.append(chain.get_id())
+
+        #quality controls
+        valid_assembly = True
+
+        #check seqres is not containing DNA/RNA
+        if valid_assembly and excl_nucl:
+            for idx, seq in seqres.items():
+                vocabulary = set([letter for letter in seq \
+                    if letter in standard_residues or letter == 'U'])
+                if vocabulary == {'A', 'T', 'C', 'G'} \
+                or vocabulary == {'A', 'U', 'C', 'G'}:
+                    valid_assembly = False
+                    fault = 'Contains DNA/RNA!'
+
+        #check PDB have no sequences with unknown residues
+        if valid_assembly and excl_unknown_residues:
+            unknown_residues = False
+            for key, seq in seqres.items():
+                for residue in seq:
+                    if residue not in standard_residues:
+                        unknown_residues = True
+                        break
+            if unknown_residues:
+                valid_assembly = False
+                fault = 'Unknown residues!'
+
+        #check seqres seqs have corresponding coordinates
+        #and skip assemblies with only one matching seq/str
+        #or containing inconsistencies
+        if valid_assembly:
+            seq_chains = list(seqres.keys())
+            for chain in seq_chains:
+                if chain not in str_chains: del(seqres[chain])
+            if len(str_chains) <= 1:
+                valid_assembly = False
+                fault = 'Only 1 chain structure or str/seqres mismatch'
+
+        #sum up quality controls
+        if not valid_assembly: return [False, pdb_code, fault]
+
+        #compute cmap
+        chains = unfold_entities(struc, 'R')
+        for idx1, chain1 in enumerate(chains):
+            for idx2, chain2 in enumerate(chains):
+                if idx1 <= idx2: continue
+                sasa.compute(chain1, level='R')
+                sasa.compute(chain2, level='R')
+
+
+        #store in object data and return
+        result = {}
+        result['seqres'] = copy.deepcopy(seqres)
+        result['cmaps'] = 
+
+        return [True, pdb_code, result]
 
 
     def load_seqres(self):
@@ -290,7 +284,7 @@ class DatasetManager():
 
         #check seqres.pkl exists
         assert os.path.exists(self.data_folder+'/seqres.pkl'), \
-            'parse_seqres() method has to be used first to generate seqres.pkl'
+            '__call__ method has to be used first to generate seqres.pkl'
 
         #load seqres info
         with open(self.data_folder+'/seqres.pkl', 'rb') as f:
@@ -301,7 +295,7 @@ class DatasetManager():
     def group_fasta(self, 
                     pdb_list,
                     output_path,
-                    af_format=False):
+                    af_foldtree=False):
         '''
         group selection of fasta sequences in a single or multiple fasta files
 
@@ -309,15 +303,15 @@ class DatasetManager():
 
         if output_path.endswith('.fasta') or af_format:
             all_fasta = ''
-            mode='manyperfasta'
+            one_per_fasta = False
         else: 
             if not os.path.exists(output_path): os.mkdir(output_path)
-            mode='oneperfasta'
+            one_per_fasta = True
 
         seqres = self.load_seqres()
         for pdb in pdb_list:
             for chain_id, seq in seqres[pdb]['seqres'].items():
-                if mode == 'oneperfasta':
+                if one_per_fasta:
                     with open(f'{output_path}/{pdb}_{chain_id}.fasta', 'w') as out:
                         out.write(f'>{pdb}_{chain_id}\n{seq}')
                 else:
@@ -328,7 +322,7 @@ class DatasetManager():
                 with open(pdb_output_path, 'w') as out: out.write(all_fasta)
                 all_fasta = ''
 
-        if mode == 'manyperfasta' and not af_format:
+        if not one_per_fasta and not af_format:
             with open(output_path, 'w') as out: out.write(all_fasta) 
 
 
@@ -347,7 +341,7 @@ class DatasetManager():
         data = data.encode('utf-8')
         req = urllib.request.Request(url, data)
         with urllib.request.urlopen(req) as f:
-        response = f.read()
+            response = f.read()
         print(response.decode('utf-8'))
 
 
@@ -468,15 +462,6 @@ def main():
 
     plt.savefig('chain_number_dist.png')
 
-#    sasa = ShrakeRupley()
-#    cid = chains[0].get_id()
-#    sasa.compute(struc, level='C')
-#    print (struc[0][cid].sasa)        
-#    for chain in chains:
-#    sasa.compute(chain, level='C')
-#    print (chain.sasa)
-#    break
-        
 
 if __name__ == '__main__':
 
