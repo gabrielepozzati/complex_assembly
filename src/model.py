@@ -36,6 +36,7 @@ def get_initializer_scale(initializer_name, input_shape):
 
   return w_init
 
+
 class Linear(hk.Module):
   """Protein folding specific Linear module.
   This differs from the standard Haiku Linear in a few ways:
@@ -172,12 +173,12 @@ class TriangleMultiplication(hk.Module):
   Jumper et al. (2021) Suppl. Alg. 12 "TriangleMultiplicationIncoming"
   """
 
-  def __init__(self, channels, outgoing=False, name='triangle_multiplication'):
+  def __init__(self, channels, outgoing=True, name='triangle_multiplication'):
     super().__init__(name=name)
     self.channels = channels
     self.outgoing = outgoing
 
-  def __call__(self, act, mask, is_training=True):
+  def __call__(self, pair_data):
     """Builds TriangleMultiplication module.
     Arguments:
       act: Pair activations, shape [N_res, N_res, c_z]
@@ -186,63 +187,66 @@ class TriangleMultiplication(hk.Module):
     Returns:
       Outputs, same shape/type as act.
     """
+   
+    pair_data = hk.LayerNorm(axis=[-1], create_scale=True, 
+        create_offset=True, name='layer_norm_input')(pair_data)
+    
+    # shortcut
+    input_data = pair_data
 
-    act = hk.LayerNorm(axis=[-1], create_scale=True, create_offset=True,
-                       name='layer_norm_input')(act)
-    input_act = act
-
+    # extracting first two indexes
     left_projection = Linear(self.channels, name='left_projection')
-    left_proj_act = mask * left_projection(act)
+    left_proj_act = left_projection(pair_data)
 
     right_projection = Linear(self.channels, name='right_projection')
-    right_proj_act = mask * right_projection(act)
+    right_proj_act = right_projection(jnp.transpose(pair_data, -2, -3))
 
+    # gating first two indexes
     left_gate_values = jax.nn.sigmoid(
-        Linear(self.channels, name='left_gate')(act))
+        Linear(self.channels, name='left_gate')(pair_data))
     right_gate_values = jax.nn.sigmoid(
-        Linear(self.channels, name='right_gate')(act))
+        Linear(self.channels, name='right_gate')(jnp.transpose(pair_data, -2, -3))
 
     left_proj_act *= left_gate_values
     right_proj_act *= right_gate_values
 
-    # "Outgoing" edges equation: 'ikc,jkc->ijc'
-    # "Incoming" edges equation: 'kjc,kic->ijc'
-    # Note on the Suppl. Alg. 11 & 12 notation:
-    # For the "outgoing" edges, a = left_proj_act and b = right_proj_act
-    # For the "incoming" edges, it's swapped:
-    #   b = left_proj_act and a = right_proj_act
-    if self.outgoing: 
-        equation = 'ikc,jkc->ijc'
-        act = jnp.einsum(equation, left_proj_act, right_proj_act)
-    else: 
-        equation = 'kjc,kic->ijc'
-        act = jnp.einsum(equation, right_proj_act, left_proj_act)
+    # triangulation
+    if self.outgoing:
+        if self.squared: equation = 'ikc,jkc->ijc'
+        else: equation = 'ikc,kjc->ijc'
+        pair_data = jnp.einsum(equation, left_proj_act, right_proj_act)
+    else:
+        if self.squared: equation = 'kjc,kic->ijc'
+        else: equation = 'kjc,ikc->ijc'
+        pair_data = jnp.einsum(equation, right_proj_act, left_proj_act)
 
-    act = hk.LayerNorm(axis=[-1], create_scale=True, 
-        create_offset=True, name='center_layer_norm')(act)
+    pair_data = hk.LayerNorm(axis=[-1], create_scale=True, 
+        create_offset=True, name='center_layer_norm')(pair_data)
 
+    # gating with shortcut
     output_channel = int(input_act.shape[-1])
-
-    act = Linear(output_channel, initializer=utils.final_init(gc),
-        name='output_projection')(act)
+    pair_data = Linear(output_channel, name='output_projection')(pair_data)
 
     gate_values = jax.nn.sigmoid(
-        Linear(output_channel, name='gating_linear')(input_act))
-    act *= gate_values
+        Linear(output_channel, name='gating_linear')(input_data))
+    
+    pair_data *= gate_values
 
-    return act
+    return pair_data
 
 
 class TriangleAttention(hk.Module):
   """Triangle multihead attention."""
 
-  def __init__(self, num_heads, output_dim, name='attention'):
+  def __init__(self, num_heads, channels, 
+               end_node=False, squared=False, name='attention'):
+
     super().__init__(name=name)
-
     self.num_heads = num_heads
-    self.output_dim = output_dim
+    self.channels = channels
+    self.end_node = end_node
 
-  def __call__(self, q_data, m_data, bias):
+  def __call__(self, pair_data):
     """Builds Attention module.
     Arguments:
       q_data: A tensor of queries, shape [batch_size, N_queries, q_channels].
@@ -253,33 +257,49 @@ class TriangleAttention(hk.Module):
     Returns:
       A float32 tensor of shape [batch_size, N_queries, output_dim].
     """
-    # Default attention
+    # swap to end node triangle attention
+    if not end_node: pair_data = jnp.swapaxes(pair_data, -2, -3)
+
+    # query, keys and values normalization
+    pair_data = hk.LayerNorm(axis=[-1], create_scale=True, 
+        create_offset=True, name='qkv_norm')(pair_data)
+
+    # computing pair representation bias
+    init_factor = 1. / jnp.sqrt(int(pair_data.shape[-1]))
+    weights = hk.get_parameter(
+        'feat_2d_weights', shape=(pair_data.shape[-1], self.num_head),
+        init=hk.initializers.RandomNormal(stddev=init_factor))
+    uniq_bias = jnp.einsum('qkc,ch->hqk', pair_data, weights)
+
+    # default attention
+    if squared: pair_trans = pair_data
+    else: pair_trans = jnp.swapaxes(pair_data, -2, -3)
+
     q_weights = hk.get_parameter(
-        'query_w', shape=(q_data.shape[-1], self.num_head, self.output_dim),
+        'query_w', shape=(pair_data.shape[-1], self.num_head, self.channels),
         init=glorot_uniform())
     k_weights = hk.get_parameter(
-        'key_w', shape=(m_data.shape[-1], self.num_head, self.output_dim),
+        'key_w', shape=(pair_trans.shape[-1], self.num_head, self.channels),
         init=glorot_uniform())
     v_weights = hk.get_parameter(
-        'value_w', shape=(m_data.shape[-1], self.num_head, self.output_dim),
+        'value_w', shape=(pair_trans.shape[-1], self.num_head, self.channels),
         init=glorot_uniform())
 
-    q = jnp.einsum('bqa,ahc->bqhc', q_data, q_weights) * key_dim**(-0.5)
-    k = jnp.einsum('bka,ahc->bkhc', m_data, k_weights)
-    v = jnp.einsum('bka,ahc->bkhc', m_data, v_weights)
-    logits = jnp.einsum('bqhc,bkhc->bhqk', q, k) + bias
-    if nonbatched_bias is not None:
-      logits += jnp.expand_dims(nonbatched_bias, axis=0)
+    q = jnp.einsum('bqa,ahc->bqhc', pair_data, q_weights) * self.channels**(-0.5)
+    k = jnp.einsum('bka,ahc->bkhc', pair_trans, k_weights)
+    v = jnp.einsum('bka,ahc->bkhc', pair_trans, v_weights)
+    
+    logits = jnp.einsum('bqhc,bkhc->bhqk', q, k) + uniq_bias
     weights = jax.nn.softmax(logits)
     weighted_avg = jnp.einsum('bhqk,bkhc->bqhc', weights, v)
 
-    # Gate updating
+    # gate updating
     gating_weights = hk.get_parameter(
         'gating_w', shape=(q_data.shape[-1], num_head, value_dim),
         init=hk.initializers.Constant(0.0))
+
     gating_bias = hk.get_parameter(
-        'gating_b',
-        shape=(num_head, value_dim),
+        'gating_b', shape=(num_head, value_dim),
         init=hk.initializers.Constant(1.0))
 
     gate_values = jnp.einsum('bqc, chv->bqhv', q_data,
@@ -287,18 +307,43 @@ class TriangleAttention(hk.Module):
     
     gate_values = jax.nn.sigmoid(gate_values)
 
-    # Gate application
+    # gate application
     weighted_avg *= gate_values
 
     init = glorot_uniform()
+    
     o_weights = hk.get_parameter(
-        'output_w', shape=(num_head, value_dim, self.output_dim),
+        'output_w', shape=(num_head, value_dim, self.channels),
         init=init)
-    o_bias = hk.get_parameter('output_b', shape=(self.output_dim,),
+    
+    o_bias = hk.get_parameter('output_b', shape=(self.channels,),
                               init=hk.initializers.Constant(0.0))
 
     output = jnp.einsum('bqhc,hco->bqo', weighted_avg, o_weights) + o_bias
 
+    # swap axis back to original
+    if not end_node: pair_data = jnp.swapaxes(pair_data, -2, -3)
+
     return output
 
+
+class TriangleModule(hk.Module)
+  def __init__(self, num_heads, num_channels, squared=False):
+    edge_ta_start = TriangleAttention(
+        num_heads, num_channels, squared=squared)
+
+    edge_ta_end = TriangleAttention(
+        num_heads, num_channels, end_node=True, squared)
+
+    edge_tm_out = TriangleMultiplication(num_channels)
+    
+    edge_tm_in = TriangleMultiplication(num_channels, outgoing=False)
+
+  def __call__(self, pair_data):
+    pair_data = edge_ta_start(pair_data)
+    pair_data = edge_ta_end(pair_data)
+    pair_data = edge_tm_out(pair_data)
+    pair_data = edge_tm_in(pair_data)
+     
+        
 

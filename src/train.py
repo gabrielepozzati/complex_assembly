@@ -117,21 +117,27 @@ def loss_fn(forward_fn,
 
     return avg/len(out_list)
 
-def build_forward_fn(num_heads: int):
+def build_forward_fn(num_heads: int, num_channels: int):
     """Create the model's forward pass."""
 
     def forward_fn(data) -> jnp.ndarray:
         """Forward pass."""
-        # set network params
-        ks = 8
-        contact_thr = 8
-        chain_num = len(clouds)
-        progress_track = [0 for chain in clouds]
         
-        
+        # unpack tensors
+        cloud_tuple, graph_tuple = data
+        chain_num = len(cloud_tuple)
+        progress_track = [0 for chain in cloud_tuple]
 
-        encoder = MultiHeadAttention(num_heads=num_heads, key_size=ks)
-        matcher = MultiHeadAttention(num_heads=num_heads, key_size=ks)
+        # layers definitions
+        encoder1 = Linear(num_channels**2, num_input_dims=2)
+        encoder2 = Linear(num_channels)
+
+        
+        
+        node_update = Linear(num_channels)
+        edge_update = Linear(num_channels)
+        global_update = Linear(1)
+
         docker1 = MultiHeadAttention(num_heads=num_heads, key_size=ks*ks)
         docker2 = Linear(ks*ks)
         rotator = Linear(3)
@@ -218,60 +224,6 @@ def build_forward_fn(num_heads: int):
         return out_list
     return forward_fn
 
-def example_generator(dataset):
-    graphs = ()
-    id_transform = [1,0,0,0,0,0,0]
-    for pdb in dataset:
-        cloud = dataset[pdb]['cloud']
-        total_len = cloud.shape[0]
-
-        # unpack complex-wise data
-        node_feats = dataset[pdb]['nodes']
-        edge_feats = dataset[pdb]['edges']
-        out_edges = dataset[pdb]['sender']
-        in_edges = dataset[pdb]['receiver']
-        
-        edge_labels = dataset[pdb]['labels']
-        surface_mask = dataset[pdb]['smask']
-        id_mask = dataset[pdb]['imask']
-
-        # define chain boundaries
-        split_idx = []
-        prev_chain = ''
-        for idx, (sid, mid, cid, rid) in enumerate(id_mask):
-            if prev_chain == '': prev_chain = cid
-            if cid != prev_chain: split_idx.append(idx)
-            prev_chain = cid
-
-        # split point clouds by chain
-        clouds = jnp.split(cloud, split_idx)
-
-        # split graph-features by chain
-        nodes = jnp.split(nodes, split_idx)
-        
-        first_idx = 0
-        in_edges_single = []
-        out_edges_single = []
-        edge_feats_single = []
-        for last_idx in enumerate(split_idx+[total_len]):
-            for idx in enumerate(out_edges): 
-                if out_edges[idx] in range(first_idx, last_idx) \
-                and in_edges[idx] in range(first_idx, last_idx):
-                    in_edges_single.append(in_edges[idx])
-                    out_edges_single.append(out_edges[idx])
-                    edge_feats_single.append(edge_feats[idx])
-            first_idx = last_idx
-            graphs += (
-                jraph.GraphsTuple(
-                    nodes=nodes_single, senders=out_edges_single,
-                    receivers=in_edges_single, edges=edge_feats_single,
-                    n_node=len(node_single), n_edge=len(edge_feats_single), 
-                    globals=id_transform))
-
-        yield (clouds, graphs)
-
-
-
 def main():
     # Run parameters
     num_heads = 8
@@ -308,7 +260,7 @@ def main():
         loss_acc = 0
         for pdb in dataset:
             if len(dataset[pdb]['chains'].keys()) == 1: continue
-            example = example_packer(dataset[pdb])
+             = dataset[pdb]
             state, metrics = updater.update(state, example)
             if step == 0: print (pdb)
             loss_acc += metrics['loss']

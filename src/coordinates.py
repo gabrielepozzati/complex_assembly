@@ -11,31 +11,19 @@ from Bio.PDB.MMCIFParser import MMCIFParser
 from Bio.PDB.Selection import unfold_entities
 from scipy.spatial.transform import Rotation as R
 
-def get_chains(array, id_mask):
-    last_cid = ''
-    split_idxs = []
-    for idx, (sid, mid, cid, rid) in enumerate(id_mask):
-        if last_cid == '': last_cid = cid
-        elif cid != last_cid: split_idxs.append(idx)
-        last_cid = cid
-    return jnp.split(array, split_idxs)
-
-def initialize_clouds(array: jnp.ndarray, id_mask, 
-                      seed: int) -> Dict[str, jnp.ndarray]:
-
-    chains = get_chains(array, id_mask)
+def initialize_clouds(clouds: list, seed: int) -> Dict[str, jnp.ndarray]:
 
     tgroup = []
     rotated_chains = []
-    for idx, chain in enumerate(chains):
+    for idx, chain in enumerate(clouds):
         rotation = R.random(random_state=seed).as_matrix()
         chain = jnp.matmul(rotation, chain.transpose()).transpose()
         cm = jnp.sum(chain, axis=0)/chain.shape[0]
         rotated_chains.append(chain - cm)
         tgroup.append([rotation, cm])
-    return jnp.concatenate(rotated_chains, axis=0), tgroup
+    return rotated_chains, tgroup
 
-def write_mmcif(id_mask, transforms, in_path, out_path) -> None:
+def write_mmcif(chain_ids, transforms, in_path, out_path) -> None:
     io = MMCIFIO()
     pdbp = PDBParser()
     cifp = MMCIFParser()
@@ -55,12 +43,6 @@ def write_mmcif(id_mask, transforms, in_path, out_path) -> None:
     out_struc.add(out_model)
     out_model.set_parent(out_struc)
 
-    ids = []
-    for sid, mid, cid, rid in id_mask:
-        if [mid, cid] not in ids: ids.append([mid, cid])
-
-    #assert len(ids) == len(transforms)
-    #print (ids, transforms)
     for rot, tr in transforms:
         mid, cid = ids.pop(0)
         if mid in struc1:

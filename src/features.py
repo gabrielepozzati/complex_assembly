@@ -1,6 +1,7 @@
 import os
 import sys
 import glob
+import jraph
 import pickle
 import jax.numpy as jnp
 import pdb as debug
@@ -234,15 +235,20 @@ def format_data(pdb_paths: list, out_path: str):
         structure2 = cifp.get_structure(pdb, path2)
         dataset[pdb] = {}
 
-        cloud = []
-        id_mask = []
-        surf_mask = []
-        surf_features = []
-        for chain in unfold_entities(structure1, 'C')+unfold_entities(structure2, 'C'):
+        clouds = []
+        graphs = []
+        surf_masks = []
+        chains1 = unfold_entities(structure1, 'C')
+        chains2 = unfold_entities(structure2, 'C')
+        chains = chains1+chains2
+        for chain in chains:
             sasa.compute(chain, level='R')
             sasa.compute(chain, level='A')
             cid = chain.get_id()
-            
+           
+            cloud = []
+            nodes = []
+            surf_mask = []
             for residue in chain: 
                 rid = residue.get_resname()
                 if rid not in standard_residues_three: continue
@@ -255,57 +261,66 @@ def format_data(pdb_paths: list, out_path: str):
                 # get residue RSA
                 surf_mask.append(residue.sasa/max_asa[rid])
 
-                # add some tracking to the original structure lines
-                id_mask.append(residue.get_full_id())
-
-                # get atom types/ASA to compute features
-                surf_feature = []
+                # get atom types/ASA to compute node features
+                atoms = []
                 for atom in residue:
                     aid = atom.get_id()
-                    surf_feature.append(atom_types[rid][aid]+[atom.sasa])
-                while len(surf_feature) < 16: surf_feature.append(12*[0])
-                surf_features.append(surf_feature)
+                    atoms.append(atom_types[rid][aid]+[atom.sasa])
+                while len(atoms) < 16: atoms.append(12*[0])
+                nodes.append(atoms)
         
-        # compute all vs all cmap
-        cloud = jnp.array(cloud)
-        cloud_len = cloud.shape[0]
-        cloud1 = jnp.expand_dims(cloud, axis=1)
-        cloud2 = jnp.expand_dims(cloud, axis=0)
-        cloud1 = jnp.broadcast_to(cloud1, (cloud_len, cloud_len, 3))
-        cloud2 = jnp.broadcast_to(cloud2, (cloud_len, cloud_len, 3))
-        cmap = jnp.sqrt(jnp.sum((cloud1-cloud2)**2, axis=-1))
+            # store point cloud and surface mask
+            cloud = jnp.array(cloud)
+            clouds.append(cloud)
+            surf_mask = jnp.array(surf_mask)
+            surf_masks.append(surf_mask)
 
-        # compute edges and edges features
-        sender, receiver = [], []
-        edge_feats, edge_labels = [], []
-        for idx1 in range(cloud_len):
-            for idx2 in range(cloud_len):
-                if idx1 == idx2: continue
-                sender.append(idx1)
-                receiver.append(idx2)
-                edge_feats.append(cmap[idx1][idx2])
+            # compute all vs all cmap
+            cmap = jnp.sqrt(jnp.sum(
+                (cloud[:, None, :]-cloud[None, :, :])**2, axis=-1))
 
-                cid1 = id_mask[idx1][2]
-                cid2 = id_mask[idx2][2]
-                if cid1 == cid2: edge_labels.append([1,0])
-                else: edge_labels.append([0,1])
+            # compute edges and edges features
+            sidx, ridx = jnp.indices(cmap.shape)
+            sidx, ridx = jnp.ravel(sidx), jnp.ravel(ridx)
+            edges = cmap[sidx,ridx]
 
-        cloud, tgroup = initialize_clouds(cloud, id_mask, 42)
+            # put together chain graph and store it
+            graph = jraph.GraphsTuple(
+                nodes=nodes, senders=sidx, receivers=ridx,
+                edges=edges, n_node=len(nodes), n_edge=len(edges), 
+                globals=jnp.array([1,0,0,0,0,0,0]))
+            graphs.append(graph)
 
-        dataset[pdb]['cloud'] = jnp.array(cloud, dtype=jnp.float32)
-        dataset[pdb]['nodes'] = jnp.array(surf_features, dtype=jnp.float32)
-        dataset[pdb]['edges'] = jnp.array(edge_feats, dtype=jnp.float32)
-        dataset[pdb]['sender'] = jnp.array(sender, dtype=jnp.float32)
-        dataset[pdb]['receiver'] = jnp.array(receiver, dtype=jnp.float32)
-        dataset[pdb]['labels'] = jnp.array(edge_labels, dtype=jnp.float32)
-        dataset[pdb]['smask'] = jnp.array(surf_mask, dtype=jnp.float32)
-        dataset[pdb]['imask'] = id_mask
-        dataset[pdb]['tgroup'] = tgroup
+        # compute graph of real interfaces
+        sidx, ridx, edges = [], [], []
+        nodes = [chain.get_full_id()[1:] for chain in chains]
+        all_pairs = [[i,j] for i in range(len(nodes)) for j in range(len(nodes))]
+        for i, j in all_pairs:
+            if i >= j: continue
+            cmap = jnp.sqrt(jnp.sum(
+                (clouds[i][:, None, :]-clouds[j][None, :, :])**2, axis=-1))
+
+            if not jnp.any(cmap < 8): continue
+            edges += [cmap, jnp.transpose(cmap)]
+            ridx += [j, i]
+            sidx += [i, j]
+
+        igraph =  jraph.GraphsTuple(
+                nodes=nodes, senders=sidx, receivers=ridx,
+                edges=edges, n_node=len(nodes), n_edge=len(edges),
+                globals=None)
+        
+        clouds, tgroup = initialize_clouds(clouds, 42)
+
+        dataset[pdb]['clouds'] = clouds
+        dataset[pdb]['graphs'] = graphs
+        dataset[pdb]['igraph'] = igraph
+        dataset[pdb]['smask'] = surf_mask
 
         #print (tgroup)
         #print (id_mask)
         #in_paths = [path, path2]
-        #write_mmcif(id_mask, tgroup, in_paths, '/proj/berzelius-2021-29/users/x_gabpo/complex_assembly/test.cif')
+        #write_mmcif(igraph, tgroup, in_paths, '/proj/berzelius-2021-29/users/x_gabpo/complex_assembly/test.cif')
         #sys.exit()
 
     with open(out_path, 'wb') as out:
