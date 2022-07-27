@@ -16,6 +16,8 @@ from jax import random
 from model import *
 from haiku import avg_pool
 from coordinates import *
+from features import one_hot_cmap
+from graph import *
 
 
 
@@ -72,169 +74,334 @@ def loss_fn(forward_fn,
             is_training: bool = True) -> jnp.ndarray:
     """Compute the loss on data wrt params."""
 
-    out_list = forward_fn(params, rng, data)
+    clouds, tracks = forward_fn(params, rng, data)
     
-    avg = 0
-    d_avg = 0
-    c_avg = 0 
-    for id_idx, tr_idx, q, tr in out_list:
+    sen = data['igraph'].senders
+    rec = data['igraph'].receivers
+    edges = [[i, j] for i, j in zip(sen, rec)]
 
-        b, c, d = q / jnp.sqrt(jnp.sum(q**2)+1)
-        a = 1 / jnp.sqrt(jnp.sum(q**2)+1)
-        aa, bb, cc, dd = a**2, b**2, c**2, d**2
+    all_clashes = 0
+    bad_contacts = 0
+    good_contacts = 0
+    for cloud, track in zip(clouds, tracks):
+        cmap = cmap_from_2D(cloud, cloud)
+        cmap_breaks = [len(data['clouds'][idx]) for idx in track][:-1]
 
-        rot = jnp.array(
-            [[aa+bb-cc-dd, 
-              2*b*c-2*a*d,
-              2*b*d+2*a*c],
-         
-             [2*b*c+2*a*d,
-              aa-bb+cc-dd,
-              2*c*d-2*a*b],
+        e1, e2 = 0, 0
+        for idx1, c_idx1 in enumerate(track):
+            e1 += cmap_breaks[idx1]
+            for idx2, c_idx2 in enumerate(track):
+                e2 += cmap_breaks[idx2]
+                if idx1 >= idx2: continue
+                s1 = e1 - cmap_breaks[idx1]
+                s2 = e2 - cmap_breaks[idx2]
+                if e1 < len(cmap) and e2 < len(cmap):
+                    sub_cmap = cmap[s1:e1,s2:e2]
+                elif e1 == len(cmap):
+                    sub_cmap = cmap[s1:,s2:e2]
+                elif e2 == len(cmap):
+                    sub_cmap = cmap[s1:e1,s2:]                
 
-             [2*b*d-2*a*c,
-              2*c*d+2*a*b,
-              aa-bb-cc+dd]
-            ])
+                contacts = jnp.where(sub_cmap<8, 1, 0)
+                clashes = jnp.where(sub_cmap<3, 0, 1)
+                all_clashes += jnp.sum(1-clashes)
+                contacts *= clashes
 
-        id_cloud = data[id_idx]
-        tr_cloud = data[tr_idx]
-        tr_cloud = jnp.matmul(rot, jnp.transpose(tr_cloud))
-        tr_cloud = jnp.transpose(tr_cloud) + tr
-        
-        id_len = id_cloud.shape[0]
-        tr_len = tr_cloud.shape[0]
-        id_cloud = jnp.expand_dims(id_cloud, axis=1)
-        tr_cloud = jnp.expand_dims(tr_cloud, axis=0)
-        id_cloud = jnp.broadcast_to(id_cloud, (id_len, tr_len, 3))
-        tr_cloud = jnp.broadcast_to(tr_cloud, (id_len, tr_len, 3))
-        cmap = jnp.sqrt(jnp.sum((id_cloud-tr_cloud)**2, axis=-1))
-        clash_loss = jnp.sum(jnp.where(cmap<3, 3-cmap, 0))#/max(id_cloud.shape[0], tr_cloud.shape[1])
-        distance_loss = jnp.maximum(jnp.min(cmap)-4, 0)
-        avg += (distance_loss + clash_loss)
-        d_avg += distance_loss
-        c_avg += clash_loss
+                if [c_idx1, c_idx2] in edges:
+                    good_contacts += jnp.sum(contacts)
+                else: 
+                    bad_contacts += jnp.sum(contacts)
+            e2 = 0
 
-    return avg/len(out_list)
+    all_clashes = jnp.log10(all_clashes)
+    bad_contacts = jnp.log10(bad_contacts)
+    good_contacts = 1/jnp.log10(good_contacts)
+    return all_clashes+bad_contacts+good_contacts
 
 def build_forward_fn(num_heads: int, num_channels: int):
     """Create the model's forward pass."""
 
     def forward_fn(data) -> jnp.ndarray:
         """Forward pass."""
+        ################################
+        ##### layers/modules definitions
         
-        # unpack tensors
-        cloud_tuple, graph_tuple = data
-        chain_num = len(cloud_tuple)
-        progress_track = [0 for chain in cloud_tuple]
+        # node encoding
+        n_enc1 = Linear(num_channels**2, num_input_dims=2)
+        n_enc2 = MultiLayerPerceptron(num_channels, num_channels, 2)
 
-        # layers definitions
-        encoder1 = Linear(num_channels**2, num_input_dims=2)
-        encoder2 = Linear(num_channels)
+        # edge encoding
+        e_enc = MultiLayerPerceptron(num_channels, num_channels, 3)
 
+        # node convolution encoding
+        neigh_nodes_update = MultiLayerPerceptron(num_channels, num_channels, 2)
+
+        # graph aggregation encoding
+        intra_nodes_update = MultiLayerPerceptron(num_channels, num_channels, 1)
+        intra_edges_update = MultiLayerPerceptron(num_channels, num_channels, 1)
+        intra_glob_update = MultiLayerPerceptron(num_channels, num_channels, 1)
+
+        # single chain info summary
+        graph_summary = Linear(1)
+
+        # ligand receptor comparison
+        chain_comp = MultiHeadAttention(num_heads, num_channels)
+
+        # ligand info aggregation
+        comp_nodes_update = MultiLayerPerceptron(num_channels, num_channels, 2)
+        comp_edges_update = MultiLayerPerceptron(num_channels, num_channels, 2)
+        comp_glob_update = MultiLayerPerceptron(num_channels, 1, 2)
+
+        # triangle updates for chain pairs
+        #inter_tri_att = TriangleModule(num_heads, num_channels)
         
-        
-        node_update = Linear(num_channels)
-        edge_update = Linear(num_channels)
-        global_update = Linear(1)
+        # IPA module to include euclidean info into graph
+        IPA = InvariantPointAttention(num_head, num_channels, num_channels, 
+                                      num_channels, num_channels)
 
-        docker1 = MultiHeadAttention(num_heads=num_heads, key_size=ks*ks)
-        docker2 = Linear(ks*ks)
+        # adjust IPA nodes data
+        #post_ipa_proc = MultiHeadAttention(num_heads, num_channels)
+
+        # transformation graph updates
+        tr_nodes_update = MultiLayerPerceptron(num_channels, num_channels, 2)
+        tr_edges_update = MultiLayerPerceptron(num_channels, num_channels, 2)
+        tr_glob_update = MultiLayerPerceptron(num_channels, num_channels, 2)
         rotator = Linear(3)
         traslator = Linear(3)
-        norm1 = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)
-        norm2 = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)
 
-        # define clouds
-#        cmaps = []
-#        clouds = []
-#        graphs = []
-#        for chain in data['chains'].keys():
-#            # filter all surface atoms and non-surface CA
-#            idxs = jnp.argwhere(data['surface_mask'][chain]==1 or \
-#                                data['ca_mask'][chain]==1)
-#            cloud = data['chains'][chain][idxs]
-#            clouds.append(cloud)
+        # state evaluation graph updates
+        all_nodes_update = MultiLayerPerceptron(num_channels, num_channels, 2)
+        all_edges_update = MultiLayerPerceptron(num_channels, num_channels, 2)
+        all_glob_update = MultiLayerPerceptron(num_channels, num_channels, 2)
+        global_state = Linear(2)
 
-            # compute cmaps
-#            cmap = jnp.sqrt(jnp.sum((cloud**2, jnp.transpose(cloud**2)), axis=-1))
-#            cmaps.append(cmap)
+        #######################
+        ##### main network body
 
-            # compute graphs
-#            n_node = jnp.array(len(cloud))
-#            
-#            senders = jnp.array([idx1 for idx1 in range(chain_num) \
-#                for idx2 in jnp.argwhere(cmap[idx1]<contact_thr))])
-#            
-#            receivers = jnp.array([idx2 for idx1 in range(chain_num) \
-#                for idx2 in jnp.argwhere(cmap[idx1]<contact_thr))])
-#
-#            edges = jnp.array([cmap[idx1][idx2] for idx1 in range(chain_num) \
-#                for idx2 in jnp.argwhere(cmap[idx1]<contact_thr)])
-#
-#            n_edge = jnp.array(len(senders))
-#
-#            context = 
-        # embed surface clouds
-        embeddings = [jax.nn.softmax(encoder(chain, chain, chain)) for chain in clouds]
-        updates = copy.deepcopy(embeddings)
+        ch_clouds = data['clouds']
+        up_clouds = data['clouds']
+        ch_lbl, up_lbl = data['clabel'], data['clabel']
+        ch_graphs, up_graphs = [], []
+        for idx, g in enumerate(data['graphs']):
+            # graph embedding
+            g_n, g_e = g.nodes, g.edges
+            g_n = jax.nn.relu(n_enc1(g_n))
+            g_n = jax.nn.relu(n_enc2(g_n))
+            g_e = jax.nn.relu(e_enc(g_e))
+            data['graphs'][idx] = g._replace(nodes=g_n, edges=g_e)
+            
+            # nodes convolution
+            subg = distance_subgraph(g)
+            subg = GraphConvolution(update_node_fn=neigh_nodes_update)(subg)
+            g = g._replace(nodes=subg.nodes)
 
+            # graph aggregation
+            g = GraphNetwork(
+                update_node_fn=intra_nodes_update,
+                update_edge_fn=intra_edges_update,
+                update_global_fn=intra_glob_update)(g)
 
-        # compare embeddings all-vs-all
-        matches = []
-        for emb1 in updates:
-            match_line = [jax.nn.softmax(matcher(emb1, emb2, emb2)) for emb2 in embeddings]
-            matches.append(match_line)
-#        while jnp.any(progress_track == 0):
-#        # select cloud pair according to embeddings
-#            pooled_indexes = []
-#            pooled_matches = []
-#            for idx1 in range(len(embeddings)):
-#                for idx2 in range(len(embeddings)):
-#                    if idx1 > idx2: continue
-#                    if idx1 != idx2:
-#                        tensors = [matches[idx1][idx2], matches[idx2][idx1]]
-#                        tensor = jnp.concatenate(tensors, axis=0)
-#                    else: 
-#                        tensor = matches[idx1][idx2]
-#    
-#                    pooled_matches.append(avg_pool(tensor, tensor.shape, strides=1, padding='VALID'))
-#                    pooled_indexes.append([idx1, idx2])
-#            
-#            pooled_matches = jax.nn.softmax(jnp.concatenate(pooled_matches))
-#            id_idx, tr_idx = pooled_indexes[jnp.argmax(pooled_matches)]
-#            id_emb, tr_emb = embeddings[id_idx], embeddings[tr_idx]
-        
-        out_list = []
-        for id_idx, id_emb in enumerate(embeddings):
-            for tr_idx, tr_emb in enumerate(embeddings):
+            ch_graphs.append(g)
+            up_graphs.append(g)
+       
+        ch_base = [g for g in data['graphs'])]
+        up_base = [g for g in data['graphs'])]
 
-                # max contacts and min clashes between sampled structures
-                tr_emb = jax.nn.softmax(docker1(tr_emb, id_emb, id_emb)) 
-                tr_emb = norm1(tr_emb)
-                tr_emb = jnp.einsum('ab, ab -> b', tr_emb, tr_emb)
+        # summarize receptor information
+        choice = [jax.nn.relu(graph_summary(g.globals)) for g in up_graphs]
+        choice = jnp.concatenate(choice)
 
-                tr_emb = jax.nn.softmax(docker2(tr_emb))
-                tr_emb = norm2(tr_emb)
+        #focus = jnp.array((1 for _ in range(len(ch_clouds))))
+        #focus /= jnp.sum(focus)
+
+        # stop signal
+        step = 0
+        sequence = []
+        incomplete = True
+        while incomplete or step < len(ch_graphs)**2:    
+            # pick receptor
+            choice = jax.nn.softmax(choice)
+            idx_rec = jnp.argmax(choice)
+            e_rec = up_base[idx_rec].edges
+            c_rec = up_clouds[idx_rec]
+            g_rec = up_graphs[idx_rec]
+            n_rec = g_rec.nodes
+
+            # screen for best ligand
+            lig_choice = []
+            for g_lig in ch_graphs+up_graphs:
+                # compare ligand nodes with receptor nodes
+                n_lig = g_lig.nodes
+                n_lig = inter_chain_comp(n_lig, n_rec, n_rec)
                 
-                rot = jax.nn.softmax(rotator(tr_emb))
-                tr = traslator(tr_emb)
-                out_list.append([id_idx, tr_idx, rot, tr])
+                # create graph decoy with rec-lig nodes update
+                g_lig = jraph.GraphsTuple(
+                    nodes=n_lig, edges=g_lig.edges,
+                    senders=g_lig.senders, receivers=g_lig.receivers,
+                    n_node=g_lig.n_node, n_edge=g_lig.n_edge,
+                    globals=g_lig.globals)
 
-        return out_list
+                # aggregate rec-lig information over graph
+                g_lig = GraphNetwork(
+                    update_node_fn=comp_nodes_update,
+                    update_edge_fn=comp_edges_update,
+                    update_global_fn=comp_glob_update)(g_lig)
+                lig_choice.append(jax.nn.relu(g_lig.globals))
+
+            # pick ligand
+            lig_choice = jax.nn.softmax(jax.concatenate(lig_choice))
+            idx_lig = jnp.argmax(lig_choice)
+            e_lig = ch_base+up_base[idx_lig].edges
+            c_lig = ch_clouds+up_clouds[idx_lig]
+            g_lig = ch_graphs+up_graphs[idx_lig]
+            n_lig = g_lig.nodes
+
+            # initialize nodes and clouds 1D sequences of length rec_CA+lig_CA
+            all_nodes = jnp.concatenate([n_rec, n_lig], axis=0)
+            all_points = jnp.concatenate([c_rec, c_lig], axis=0)
+
+            # initialize 2D features with shape = (rec_CA+lig_CA, rec_CA+lig_CA)
+            e_rec = jnp.reshape(e_rec, [g_rec.n_node, g_rec.n_node, 34])
+            e_lig = jnp.reshape(e_lig, [g_lig.n_node, g_lig.n_node, 34])
+            
+            filler0 = jnp.zeros([g_rec.n_node, g_lig.n_node, 33])
+            filler1 = jnp.ones([g_rec.n_node, g_lig.n_node, 1])
+            filler = jnp.concatenate([filler0, filler1], axis=-1)
+            
+            all_r0 = jnp.concatenate([e_rec, filler], axis=0)
+            filler = jnp.swapaxes(filler, -2, -3)
+            all_l0 = jnp.concatenate([filler, e_lig], axis=0)
+            all_edges = jnp.concatenate([all_r0, all_l0], axis=1)
+
+            # docking steps
+            for _ in range(10):
+                # invariant point attention
+                all_nodes = IPA(all_nodes, all_edges, all_points)
+                n_rec, n_lig = jnp.split(all_nodes, [g_rec.n_node], axis=0)
+
+                # setting up graph with new features
+                g_out = jraph.GraphsTuple(
+                    nodes=n_lig, edges=e_lig,
+                    senders=g_lig.senders, receivers=g_lig.receivers,
+                    n_node=g_lig.n_node, n_edge=g_lig.n_edge,
+                    globals=g_lig.globals)
+
+                # aggregation
+                g_out = GraphNetwork(
+                    update_node_fn=tr_nodes_update,
+                    update_edge_fn=tr_edges_update,
+                    update_global_fn=tr_glob_update)(g_out)
+
+                # computing T
+                rot = jax.nn.softmax(rotator(g_out.globals))
+                rot = rot_from_pred(rot)
+                trasl = traslator(g_out.globals)
+                
+                # updated cloud 
+                c_lig = jnp.matmul(rot, jnp.transpose(c_lig))
+                c_lig = jnp.transpose(c_lig + trasl[:, None])
+                all_points = jnp.concatenate([c_rec, c_lig], axis=0)
+                
+                # updated 2D features
+                cmap = jnp.sqrt(jnp.sum(
+                    (all_points[:, None, :]-all_points[None, :, :])**2, axis=-1))
+                all_edges = one_hot_cmap(cmap)
+
+                # embed 2D features
+                all_edges = e_enc(all_edges)
+
+            # update status lists
+            if jnp.any(cmap<=8): 
+                n_rec = up_base[idx_rec]
+                n_lig = ch_base+up_base[idx_lig]
+                nodes = jnp.concatenate([n_rec, n_lig], axis=0)
+
+                senders, receivers = jnp.indices(cmap)
+                edges = all_edges[senders, receivers]
+                
+                base_graph = jraph.GraphsTuple(
+                    nodes=nodes,
+                    edges=edges, 
+                    senders=senders, 
+                    receivers=receivers
+                    n_node=jnp.array([len(nodes)]),
+                    n_edge=jnp.array([len(edges)]),
+                    globals=jnp.array([1]*8))
+                
+                # nodes convolution
+                subg = distance_subgraph(base_graph)
+                subg = GraphConvolution(update_node_fn=neigh_nodes_update)(subg)
+                up_graph = up_graph._replace(nodes=subg.nodes)
+
+                # graph aggregation
+                up_graph = GraphNetwork(
+                    update_node_fn=intra_nodes_update,
+                    update_edge_fn=intra_edges_update,
+                    update_global_fn=intra_glob_update)(up_graph)
+                summary = jax.nn.relu(graph_summary(up_graph.globals))
+
+                up_lbl[idx_rec] += ch_lbl+up_lbl[idx_lig]
+
+                # update graph, clouds and rec. choices vectors
+                if idx_rec < len(choice)-1:
+                    up_base = [up_base[:idx_rec], base_graph, up_base[idx_rec+1:]]
+                    up_graphs = [up_graphs[:idx_rec], up_graph, up_graphs[idx_rec+1:]]
+                    up_clouds = [up_clouds[:idx_rec], all_points, up_clouds[idx_rec+1:]]
+                    choice = [choice[:idx_rec], summary, choice[idx_rec+1:]]
+                else:
+                    up_base = [up_base[:idx_rec], base_graph]
+                    up_graphs = [up_graphs[:idx_rec], up_graph]
+                    up_clouds = [up_clouds[:idx_rec], all_points]
+                    choice = [choice[:idx_rec], summary]
+ 
+                up_base = jnp.concatenate(up_graphs)
+                up_graphs = jnp.concatenate(up_graphs)
+                up_clouds = jnp.concatenate(up_clouds)
+                choice = jnp.concatenate(choice)
+
+                if idx_lig >= len(ch_graph): 
+                    idx_lig -= len(ch_graph)
+                    del(up_lbl[idx_lig])
+                    
+                    if idx_lig < len(choice)-1 and idx_lig != idx_rec:
+                        up_base = [up_base[:idx_lig], up_base[idx_lig+1:]]
+                        up_graphs = [up_graphs[:idx_lig], up_graphs[idx_lig+1:]]
+                        up_clouds = [up_clouds[:idx_lig], up_clouds[idx_lig+1:]]
+                        choice = [choice[:idx_lig], choice[idx_lig+1:]]
+                        up_base = jnp.concatenate(up_graphs)
+                        up_graphs = jnp.concatenate(up_graphs)
+                        up_clouds = jnp.concatenate(up_clouds)
+                        choice = jnp.concatenate(choice)
+
+                    elif idx_lig != idx_rec:
+                        up_base = up_base[:idx_lig]
+                        up_graphs = up_graphs[:idx_lig]
+                        up_clouds = up_clouds[:idx_lig]
+                        choice = choice[:idx_lig]
+
+            # batch in a single graph
+            full_graph = jraph.batch(up_graphs)
+
+            # evaluate global status
+            full_graph = GraphNetwork(
+                    update_node_fn=all_nodes_update,
+                    update_edge_fn=all_edges_update,
+                    update_global_fn=all_glob_update)(full_graph)
+            incomplete = jnp.argmax(jax.nn.softmax(global_state(full_graph.globals)))
+
+        return [up_graphs, up_lbl]
     return forward_fn
 
 def main():
     # Run parameters
     num_heads = 8
     MAX_STEPS = 1000
-    grad_clip_value = 1
+    grad_clip_value = 0.5
     learning_rate = 0.1
 
     # Load the dataset.
     path = '/proj/berzelius-2021-29/users/x_gabpo/complex_assembly/data/train_features.pkl'
     with open(path, 'rb') as data: dataset = pickle.load(data)
-    pdb = list(dataset.keys())[0]
 
     # Set up the model
     forward_fn = build_forward_fn(num_heads)
@@ -251,17 +418,15 @@ def main():
     
     # Initialize parameters.
     rng = jax.random.PRNGKey(42)
-    state = updater.init(rng, example)
+    pdb = list(dataset.keys())[0]
+    state = updater.init(rng, dataset[pdb])
 
-    
     for step in range(MAX_STEPS):
         print (f'Epoch {step} ...')
         count = 0
         loss_acc = 0
         for pdb in dataset:
-            if len(dataset[pdb]['chains'].keys()) == 1: continue
-             = dataset[pdb]
-            state, metrics = updater.update(state, example)
+            state, metrics = updater.update(state, dataset[pdb])
             if step == 0: print (pdb)
             loss_acc += metrics['loss']
             count += 1

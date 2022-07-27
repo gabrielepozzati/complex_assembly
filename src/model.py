@@ -37,6 +37,16 @@ def get_initializer_scale(initializer_name, input_shape):
   return w_init
 
 
+def traslate_point(self, point, translation, extra_dims=0):
+  for _ in range(extra_dims):
+      expand_fn = functools.partial(jnp.expand_dims, axis=-1)
+      translation = jax.tree_map(expand_fn, translation)
+
+  return [point[0] + translation[0],
+          point[1] + translation[1],
+          point[2] + translation[2]]
+
+
 class Linear(hk.Module):
   """Protein folding specific Linear module.
   This differs from the standard Haiku Linear in a few ways:
@@ -205,7 +215,7 @@ class TriangleMultiplication(hk.Module):
     left_gate_values = jax.nn.sigmoid(
         Linear(self.channels, name='left_gate')(pair_data))
     right_gate_values = jax.nn.sigmoid(
-        Linear(self.channels, name='right_gate')(jnp.transpose(pair_data, -2, -3))
+        Linear(self.channels, name='right_gate')(jnp.transpose(pair_data, -2, -3)))
 
     left_proj_act *= left_gate_values
     right_proj_act *= right_gate_values
@@ -327,23 +337,306 @@ class TriangleAttention(hk.Module):
     return output
 
 
-class TriangleModule(hk.Module)
+class TriangleModule(hk.Module):
   def __init__(self, num_heads, num_channels, squared=False):
     edge_ta_start = TriangleAttention(
         num_heads, num_channels, squared=squared)
 
     edge_ta_end = TriangleAttention(
-        num_heads, num_channels, end_node=True, squared)
+        num_heads, num_channels, end_node=True, squared=squared)
 
     edge_tm_out = TriangleMultiplication(num_channels)
     
     edge_tm_in = TriangleMultiplication(num_channels, outgoing=False)
 
   def __call__(self, pair_data):
+
     pair_data = edge_ta_start(pair_data)
     pair_data = edge_ta_end(pair_data)
     pair_data = edge_tm_out(pair_data)
     pair_data = edge_tm_in(pair_data)
      
-        
+    return pair_data
 
+
+class InvariantPointAttention(hk.Module):
+  """Invariant Point attention module.
+  The high-level idea is that this attention module works over a set of points
+  and associated orientations in 3D space (e.g. protein residues).
+  Each residue outputs a set of queries and keys as points in their local
+  reference frame.  The attention is then defined as the euclidean distance
+  between the queries and keys in the global frame.
+  Jumper et al. (2021) Suppl. Alg. 22 "InvariantPointAttention"
+  """
+
+  def __init__(self, num_head,
+               num_scalar_qk, num_scalar_v,
+               num_point_qk, num_point_v,
+               num_output, dist_epsilon=1e-8,
+               name='invariant_point_attention'):
+    """Initialize.
+    Args:
+      config: Structure Module Config
+      global_config: Global Config of Model.
+      dist_epsilon: Small value to avoid NaN in distance calculation.
+      name: Haiku Module name.
+    """
+    super().__init__(name=name)
+
+    self._dist_epsilon = dist_epsilon
+    self._zero_initialize_last = False
+
+  def __call__(self, inputs_1d, inputs_2d, cloud):
+    """Compute geometry-aware attention.
+    Given a set of query residues (defined by affines and associated scalar
+    features), this function computes geometry-aware attention between the
+    query residues and target residues.
+    The residues produce points in their local reference frame, which
+    are converted into the global frame in order to compute attention via
+    euclidean distance.
+    Equivalently, the target residues produce points in their local frame to be
+    used as attention values, which are converted into the query residues'
+    local frames.
+    Args:
+      inputs_1d: (N, C) 1D input embedding that is the basis for the
+        scalar queries.
+      inputs_2d: (N, M, C') 2D input embedding, used for biases and values.
+      mask: (N, 1) mask to indicate which elements of inputs_1d participate
+        in the attention.
+      affine: QuatAffine object describing the position and orientation of
+        every element in inputs_1d.
+    Returns:
+      Transformation of the input embedding.
+    """
+    num_residues, _ = inputs_1d.shape
+
+    # Improve readability by removing a large number of 'self's.
+    num_head = self.config.num_head
+    num_scalar_qk = self.config.num_scalar_qk
+    num_point_qk = self.config.num_point_qk
+    num_scalar_v = self.config.num_scalar_v
+    num_point_v = self.config.num_point_v
+    num_output = self.config.num_channel
+
+    # Construct scalar queries of shape:
+    # [num_query_residues, num_head, num_points]
+    q_scalar = Linear(
+        num_head * num_scalar_qk, name='q_scalar')(
+            inputs_1d)
+    q_scalar = jnp.reshape(
+        q_scalar, [num_residues, num_head, num_scalar_qk])
+
+    # Construct scalar keys/values of shape:
+    # [num_target_residues, num_head, num_points]
+    kv_scalar = Linear(
+        num_head * (num_scalar_v + num_scalar_qk), name='kv_scalar')(
+            inputs_1d)
+    kv_scalar = jnp.reshape(kv_scalar,
+                            [num_residues, num_head,
+                             num_scalar_v + num_scalar_qk])
+    k_scalar, v_scalar = jnp.split(kv_scalar, [num_scalar_qk], axis=-1)
+
+    # Construct query points of shape:
+    # [num_residues, num_head, num_point_qk]
+
+    # First construct query points in local frame.
+    q_point_local = Linear(
+        num_head * 3 * num_point_qk, name='q_point_local')(
+            inputs_1d)
+    q_point_local = jnp.split(q_point_local, 3, axis=-1)
+    # Project query points into global frame.
+    q_point_global = traslate_point(q_point_local, cloud, extra_dims=1)
+    # Reshape query point for later use.
+    q_point = [
+        jnp.reshape(x, [num_residues, num_head, num_point_qk])
+        for x in q_point_global]
+
+    # Construct key and value points.
+    # Key points have shape [num_residues, num_head, num_point_qk]
+    # Value points have shape [num_residues, num_head, num_point_v]
+
+    # Construct key and value points in local frame.
+    kv_point_local = Linear(
+        num_head * 3 * (num_point_qk + num_point_v), name='kv_point_local')(
+            inputs_1d)
+    kv_point_local = jnp.split(kv_point_local, 3, axis=-1)
+    # Project key and value points into global frame.
+    kv_point_global = traslate_point(kv_point_local, cloud, extra_dims=1)
+    kv_point_global = [
+        jnp.reshape(x, [num_residues,
+                        num_head, (num_point_qk + num_point_v)])
+        for x in kv_point_global]
+    # Split key and value points.
+    k_point, v_point = list(
+        zip(*[
+            jnp.split(x, [num_point_qk,], axis=-1)
+            for x in kv_point_global
+        ]))
+
+    # We assume that all queries and keys come iid from N(0, 1) distribution
+    # and compute the variances of the attention logits.
+    # Each scalar pair (q, k) contributes Var q*k = 1
+    scalar_variance = max(num_scalar_qk, 1) * 1.
+    # Each point pair (q, k) contributes Var [0.5 ||q||^2 - <q, k>] = 9 / 2
+    point_variance = max(num_point_qk, 1) * 9. / 2
+
+    # Allocate equal variance to scalar, point and attention 2d parts so that
+    # the sum is 1.
+
+    num_logit_terms = 3
+
+    scalar_weights = np.sqrt(1.0 / (num_logit_terms * scalar_variance))
+    point_weights = np.sqrt(1.0 / (num_logit_terms * point_variance))
+    attention_2d_weights = np.sqrt(1.0 / (num_logit_terms))
+
+    # Trainable per-head weights for points.
+    trainable_point_weights = jax.nn.softplus(hk.get_parameter(
+        'trainable_point_weights', shape=[num_head],
+        # softplus^{-1} (1)
+        init=hk.initializers.Constant(np.log(np.exp(1.) - 1.))))
+    point_weights *= jnp.expand_dims(trainable_point_weights, axis=1)
+
+    v_point = [jnp.swapaxes(x, -2, -3) for x in v_point]
+    q_point = [jnp.swapaxes(x, -2, -3) for x in q_point]
+    k_point = [jnp.swapaxes(x, -2, -3) for x in k_point]
+
+    dist2 = [
+        squared_difference(qx[:, :, None, :], kx[:, None, :, :])
+        for qx, kx in zip(q_point, k_point)
+    ]
+    dist2 = sum(dist2)
+
+    attn_qk_point = -0.5 * jnp.sum(
+        point_weights[:, None, None, :] * dist2, axis=-1)
+
+    v = jnp.swapaxes(v_scalar, -2, -3)
+    q = jnp.swapaxes(scalar_weights * q_scalar, -2, -3)
+    k = jnp.swapaxes(k_scalar, -2, -3)
+    attn_qk_scalar = jnp.matmul(q, jnp.swapaxes(k, -2, -1))
+    attn_logits = attn_qk_scalar + attn_qk_point
+
+    attention_2d = common_modules.Linear(
+        num_head, name='attention_2d')(
+            inputs_2d)
+
+    attention_2d = jnp.transpose(attention_2d, [2, 0, 1])
+    attention_2d = attention_2d_weights * attention_2d
+    attn_logits += attention_2d
+
+    #mask_2d = mask * jnp.swapaxes(mask, -1, -2)
+    #attn_logits -= 1e5 * (1. - mask_2d)
+
+    # [num_head, num_query_residues, num_target_residues]
+    attn = jax.nn.softmax(attn_logits)
+
+    # [num_head, num_query_residues, num_head * num_scalar_v]
+    result_scalar = jnp.matmul(attn, v)
+
+    # For point result, implement matmul manually so that it will be a float32
+    # on TPU.  This is equivalent to
+    # result_point_global = [jnp.einsum('bhqk,bhkc->bhqc', attn, vx)
+    #                        for vx in v_point]
+    # but on the TPU, doing the multiply and reduce_sum ensures the
+    # computation happens in float32 instead of bfloat16.
+    result_point_global = [jnp.sum(
+        attn[:, :, :, None] * vx[:, None, :, :],
+        axis=-2) for vx in v_point]
+
+    # [num_query_residues, num_head, num_head * num_(scalar|point)_v]
+    result_scalar = jnp.swapaxes(result_scalar, -2, -3)
+    result_point_global = [
+        jnp.swapaxes(x, -2, -3)
+        for x in result_point_global]
+
+    # Features used in the linear output projection. Should have the size
+    # [num_query_residues, ?]
+    output_features = []
+
+    result_scalar = jnp.reshape(
+        result_scalar, [num_residues, num_head * num_scalar_v])
+    output_features.append(result_scalar)
+
+    result_point_global = [
+        jnp.reshape(r, [num_residues, num_head * num_point_v])
+        for r in result_point_global]
+    result_point_local = traslate_point(result_point_global, -(cloud), extra_dims=1)
+    output_features.extend(result_point_local)
+
+    output_features.append(jnp.sqrt(self._dist_epsilon +
+                                    jnp.square(result_point_local[0]) +
+                                    jnp.square(result_point_local[1]) +
+                                    jnp.square(result_point_local[2])))
+
+    # Dimensions: h = heads, i and j = residues,
+    # c = inputs_2d channels
+    # Contraction happens over the second residue dimension, similarly to how
+    # the usual attention is performed.
+    result_attention_over_2d = jnp.einsum('hij, ijc->ihc', attn, inputs_2d)
+    num_out = num_head * result_attention_over_2d.shape[-1]
+    output_features.append(
+        jnp.reshape(result_attention_over_2d,
+                    [num_residues, num_out]))
+
+    final_init = 'zeros' if self._zero_initialize_last else 'linear'
+
+    final_act = jnp.concatenate(output_features, axis=-1)
+
+    return Linear(
+        num_output,
+        initializer=final_init,
+        name='output_projection')(final_act)
+
+class SingleGraphUpdate(hk.Module):
+
+  def __init__(self, num_head, num_channels):
+    encoder1 = Linear(num_channels**2, num_input_dims=2)
+    encoder2 = Linear(num_channels)
+
+    neigh_nodes_update = MultiLayerPerceptron(num_channels, num_channels, 2)
+
+    #intra_tri_att = TriangleModule(num_heads, num_channels)
+    intra_tri_att = MultiHeadAttention(num_heads, num_channels)
+
+    intra_nodes_update = MultiLayerPerceptron(num_channels, num_channels, 1)
+    intra_edges_update = MultiLayerPerceptron(num_channels, num_channels, 1)
+    intra_glob_update = MultiLayerPerceptron(num_channels, num_channels, 1)
+
+  def __call__(self, g):
+    up_nodes = jax.nn.relu(encoder1(g.nodes))
+    up_nodes = jax.nn.relu(encoder2(up_nodes))
+    g._replace(nodes=up_nodes)
+               
+    # aggregate node neighbours
+    subg = distance_subgraph(g) 
+    subg = GraphConvolution(update_node_fn=neigh_nodes_update)(subg)
+    g._replace(nodes=subg.nodes)
+
+    # update edges with nodes info and triangle attention
+    cmap = jnp.reshape(g.edges, (g.n_node, g.n_node))
+    cmap = jnp.expand_dims(cmap, axis=-1)
+    up_cmap = jnp.concatenate([g.nodes[None, :, :], g.nodes[:, None, :], cmap], axis=-1)
+    up_cmap = intra_tri_att(up_cmap)
+    g._replace(edges=up_cmap[g.senders, g.receivers])
+
+    # aggregate graph on global feature
+    return GraphNetwork(
+        update_node_fn=intra_nodes_update,
+        update_edge_fn=intra_edges_update,
+        update_global_fn=intra_glob_update)(g)
+
+
+class MultiLayerPerceptron(hk.Module):
+    
+    def __init__(self, num_channels, out_channels, num_layers):
+
+        self.stack = [Linear(num_channels) for _ in range(num_layers)]
+        self.out_layer = Linear(out_channels)
+        
+    def __call__(self, x):
+
+        for layer in self.stack:
+            x = hk.LayerNorm(axis=-1, param_axis=-1, 
+                create_scale=True, create_offset=True)(x)
+            x = jax.nn.relu(layer(x))
+
+        return self.out_layer(x)

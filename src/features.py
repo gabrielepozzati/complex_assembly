@@ -221,6 +221,16 @@ atom_types = {'ALA':{  'N':[0,1,0,0,0,0,0,0,0,0,0],
                      'CG1':[0,0,0,0,0,0,0,0,0,0,1],
                      'CG2':[0,0,0,0,0,0,0,0,0,0,1]}}
 
+def one_hot_cmap(cmap):
+    bin_size = 1
+    ones, zeros = jnp.ones(cmap.shape), jnp.zeros(cmap.shape)
+    bmap = jnp.where(cmap>32, ones, zeros)
+    for n in range(32, 0, -bin_size):
+        next_bin = jnp.where((cmap<=n) & (cmap>n-bin_size), ones, zeros)
+        bmap = jnp.concatenate([bmap, next_bin], axis=-1)
+    return jnp.concatenate([bmap, zeros], axis=-1)
+
+
 def format_data(pdb_paths: list, out_path: str):
     #cifp = MMCIFParser()
     cifp = PDBParser(QUIET=True)
@@ -279,17 +289,22 @@ def format_data(pdb_paths: list, out_path: str):
             cmap = jnp.sqrt(jnp.sum(
                 (cloud[:, None, :]-cloud[None, :, :])**2, axis=-1))
 
+            bmap = one_hot_cmap(cmap)
+
             # compute edges and edges features
             sidx, ridx = jnp.indices(cmap.shape)
             sidx, ridx = jnp.ravel(sidx), jnp.ravel(ridx)
-            edges = cmap[sidx,ridx]
-
+            edges = bmap[sidx,ridx]
+            
             # put together chain graph and store it
             graph = jraph.GraphsTuple(
                 nodes=nodes, senders=sidx, receivers=ridx,
-                edges=edges, n_node=len(nodes), n_edge=len(edges), 
-                globals=jnp.array([1,0,0,0,0,0,0]))
+                edges=edges, n_node=jnp.array([len(nodes)]), 
+                n_edge=jnp.array([len(edges)]), globals=jnp.array([1]*8))
             graphs.append(graph)
+
+        # store chain labels
+        clabels = [[idx] for idx, chain in enumerate(chains)]
 
         # compute graph of real interfaces
         sidx, ridx, edges = [], [], []
@@ -315,6 +330,7 @@ def format_data(pdb_paths: list, out_path: str):
         dataset[pdb]['clouds'] = clouds
         dataset[pdb]['graphs'] = graphs
         dataset[pdb]['igraph'] = igraph
+        dataset[pdb]['clabel'] = clabels
         dataset[pdb]['smask'] = surf_mask
 
         #print (tgroup)
