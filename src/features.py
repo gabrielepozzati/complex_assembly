@@ -298,9 +298,10 @@ def format_data(pdb_paths: list, out_path: str):
             
             # put together chain graph and store it
             graph = jraph.GraphsTuple(
-                nodes=nodes, senders=sidx, receivers=ridx,
-                edges=edges, n_node=jnp.array([len(nodes)]), 
-                n_edge=jnp.array([len(edges)]), globals=jnp.array([1]*8))
+                nodes=jnp.array(nodes), edges=jnp.array(edges), 
+                senders=jnp.array(sidx), receivers=jnp.array(ridx),
+                n_node=jnp.array([len(nodes)]), n_edge=jnp.array([len(edges)]), 
+                globals=jnp.array([1]*8))
             graphs.append(graph)
 
         # store chain labels
@@ -308,7 +309,7 @@ def format_data(pdb_paths: list, out_path: str):
 
         # compute graph of real interfaces
         sidx, ridx, edges = [], [], []
-        nodes = [chain.get_full_id()[1:] for chain in chains]
+        nodes = [idx for idx, chain in enumerate(chains)]
         all_pairs = [[i,j] for i in range(len(nodes)) for j in range(len(nodes))]
         for i, j in all_pairs:
             if i >= j: continue
@@ -344,6 +345,6 @@ def format_data(pdb_paths: list, out_path: str):
 
 
 if __name__ == '__main__':
-    datapath = '/proj/berzelius-2021-29/users/x_gabpo/complex_assembly/data/benchmark5.5/*_r_b.pdb'
-    path_list = [line.rstrip() for line in glob.glob(datapath)]
-    format_data(path_list, '/proj/berzelius-2021-29/users/x_gabpo/complex_assembly/data/train_features.pkl')
+    datapath = '/home/pozzati/complex_assembly/data/benchmark5.5/*_r_b.pdb'
+    path_list = [line.rstrip() for line in glob.glob(datapath)][:10]
+    format_data(path_list, '/home/pozzati/complex_assembly/data/train_features.pkl')

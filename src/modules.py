@@ -588,7 +588,9 @@ class InvariantPointAttention(hk.Module):
 
 class SingleGraphUpdate(hk.Module):
 
-  def __init__(self, num_head, num_channels):
+  def __init__(self, num_head, num_channels, name='GraphUpdate'):
+
+    super().__init__(name=name)
     encoder1 = Linear(num_channels**2, num_input_dims=2)
     encoder2 = Linear(num_channels)
 
@@ -627,16 +629,16 @@ class SingleGraphUpdate(hk.Module):
 
 class MultiLayerPerceptron(hk.Module):
     
-    def __init__(self, num_channels, out_channels, num_layers):
-
+    def __init__(self, num_channels, out_channels, num_layers, name='MLP'):
+        
+        super().__init__(name=name)
         self.stack = [Linear(num_channels) for _ in range(num_layers)]
         self.out_layer = Linear(out_channels)
         
     def __call__(self, x):
 
         for layer in self.stack:
-            x = hk.LayerNorm(axis=-1, param_axis=-1, 
-                create_scale=True, create_offset=True)(x)
+            x = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
             x = jax.nn.relu(layer(x))
 
         return self.out_layer(x)

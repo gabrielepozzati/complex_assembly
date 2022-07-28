@@ -13,12 +13,12 @@ import jax.numpy as jnp
 from jax import grad, jit, vmap
 from jax import random
 
-from model import *
+from modules import *
 from haiku import avg_pool
 from coordinates import *
 from features import one_hot_cmap
 from graph import *
-
+from jraph._src.models import *
 
 
 class GradientUpdater:
@@ -137,9 +137,10 @@ def build_forward_fn(num_heads: int, num_channels: int):
         neigh_nodes_update = MultiLayerPerceptron(num_channels, num_channels, 2)
 
         # graph aggregation encoding
-        intra_nodes_update = MultiLayerPerceptron(num_channels, num_channels, 1)
-        intra_edges_update = MultiLayerPerceptron(num_channels, num_channels, 1)
-        intra_glob_update = MultiLayerPerceptron(num_channels, num_channels, 1)
+        aggregation1 = GraphNetwork(
+            MultiLayerPerceptron(num_channels, num_channels, 1),
+            MultiLayerPerceptron(num_channels, num_channels, 1),
+            update_global_fn=MultiLayerPerceptron(num_channels, num_channels, 1))
 
         # single chain info summary
         graph_summary = Linear(1)
@@ -156,8 +157,8 @@ def build_forward_fn(num_heads: int, num_channels: int):
         #inter_tri_att = TriangleModule(num_heads, num_channels)
         
         # IPA module to include euclidean info into graph
-        IPA = InvariantPointAttention(num_head, num_channels, num_channels, 
-                                      num_channels, num_channels)
+        IPA = InvariantPointAttention(num_heads, num_channels, num_channels, 
+                                      num_channels, num_channels, num_channels)
 
         # adjust IPA nodes data
         #post_ipa_proc = MultiHeadAttention(num_heads, num_channels)
@@ -190,22 +191,14 @@ def build_forward_fn(num_heads: int, num_channels: int):
             g_e = jax.nn.relu(e_enc(g_e))
             data['graphs'][idx] = g._replace(nodes=g_n, edges=g_e)
             
-            # nodes convolution
-            subg = distance_subgraph(g)
-            subg = GraphConvolution(update_node_fn=neigh_nodes_update)(subg)
-            g = g._replace(nodes=subg.nodes)
-
             # graph aggregation
-            g = GraphNetwork(
-                update_node_fn=intra_nodes_update,
-                update_edge_fn=intra_edges_update,
-                update_global_fn=intra_glob_update)(g)
+            g = aggregation1(g)
 
             ch_graphs.append(g)
             up_graphs.append(g)
        
-        ch_base = [g for g in data['graphs'])]
-        up_base = [g for g in data['graphs'])]
+        ch_base = [g for g in data['graphs']]
+        up_base = [g for g in data['graphs']]
 
         # summarize receptor information
         choice = [jax.nn.relu(graph_summary(g.globals)) for g in up_graphs]
@@ -323,21 +316,18 @@ def build_forward_fn(num_heads: int, num_channels: int):
                     nodes=nodes,
                     edges=edges, 
                     senders=senders, 
-                    receivers=receivers
+                    receivers=receivers,
                     n_node=jnp.array([len(nodes)]),
                     n_edge=jnp.array([len(edges)]),
                     globals=jnp.array([1]*8))
                 
                 # nodes convolution
-                subg = distance_subgraph(base_graph)
-                subg = GraphConvolution(update_node_fn=neigh_nodes_update)(subg)
-                up_graph = up_graph._replace(nodes=subg.nodes)
+                #subg = distance_subgraph(base_graph)
+                #subg = GraphConvolution(update_node_fn=neigh_nodes_update)(subg)
+                #up_graph = up_graph._replace(nodes=subg.nodes)
 
                 # graph aggregation
-                up_graph = GraphNetwork(
-                    update_node_fn=intra_nodes_update,
-                    update_edge_fn=intra_edges_update,
-                    update_global_fn=intra_glob_update)(up_graph)
+                up_graph = aggregation1(base_graph)
                 summary = jax.nn.relu(graph_summary(up_graph.globals))
 
                 up_lbl[idx_rec] += ch_lbl+up_lbl[idx_lig]
@@ -395,16 +385,18 @@ def build_forward_fn(num_heads: int, num_channels: int):
 def main():
     # Run parameters
     num_heads = 8
+    num_channels = 16
     MAX_STEPS = 1000
     grad_clip_value = 0.5
     learning_rate = 0.1
 
     # Load the dataset.
-    path = '/proj/berzelius-2021-29/users/x_gabpo/complex_assembly/data/train_features.pkl'
+    path = '/home/pozzati/complex_assembly/data/train_features.pkl'
     with open(path, 'rb') as data: dataset = pickle.load(data)
+    pdb = list(dataset.keys())[0]
 
     # Set up the model
-    forward_fn = build_forward_fn(num_heads)
+    forward_fn = build_forward_fn(num_heads, num_channels)
     forward_fn = hk.transform(forward_fn)
     
     # Set up the loss
