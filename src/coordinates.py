@@ -11,17 +11,15 @@ from Bio.PDB.MMCIFParser import MMCIFParser
 from Bio.PDB.Selection import unfold_entities
 from scipy.spatial.transform import Rotation as R
 
-def initialize_clouds(clouds: list, seed: int) -> Dict[str, jnp.ndarray]:
+def initialize_clouds(cloud: list, seed: int) -> Dict[str, jnp.ndarray]:
 
-    tgroup = []
-    rotated_chains = []
-    for idx, chain in enumerate(clouds):
-        rotation = R.random(random_state=seed).as_matrix()
-        chain = jnp.matmul(rotation, chain.transpose()).transpose()
-        cm = jnp.sum(chain, axis=0)/chain.shape[0]
-        rotated_chains.append(chain - cm)
-        tgroup.append([rotation, cm])
-    return rotated_chains, tgroup
+    rotation = R.random(random_state=seed).as_matrix()
+    cloud = jnp.matmul(rotation, cloud.transpose()).transpose()
+    cm = jnp.sum(cloud, axis=0)/cloud.shape[0]
+    cloud = cloud - cm
+    tgroup = [rotation, cm]
+
+    return cloud, tgroup
 
 def write_mmcif(chain_ids, transforms, in_path, out_path) -> None:
     io = MMCIFIO()
