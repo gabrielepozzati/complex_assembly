@@ -1,11 +1,9 @@
 import os
 import sys
 import glob
-import jraph
 import pickle
 import jax.numpy as jnp
 import pdb as debug
-
 
 from Bio.PDB.SASA import ShrakeRupley
 from Bio.PDB.Polypeptide import is_aa
@@ -20,22 +18,27 @@ blosum62 = substitution_matrices.load("BLOSUM62")
 
 from coordinates import *
 from tables import *
+from ops import *
 
+import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.pyplot import figure
+figure(figsize=(100, 100), dpi=100)
+import seaborn as sb
 
-
-def format_data(chains, mapping):
-    masks, nodes, clouds = [], [], [] 
-    for key in mapping:
-        if type(mapping[key]) == int: continue
-        chain = chains[key]
+def format_data(code, str1, str2):
+    structures = [str1, str2]
+    masks_pair, nodes_pair, cloud_pair = [], [], [] 
+    for struc in structures:    
         sasa = ShrakeRupley()
-        sasa.compute(chain, level='R')
-        sasa.compute(chain, level='A')
-        cid = chain.get_id()
-       
-        mask, node, cloud = [], [], []
-        for residue in chain: 
+        try:
+            sasa.compute(struc, level='R')
+            sasa.compute(struc, level='A')
+        except: return [code, None]
+        struc = unfold_entities(struc, 'R')
+        
+        masks, nodes, cloud = [], [], []
+        for residue in struc: 
             rid = residue.get_resname()
             if rid not in standard_residues_three: continue
 
@@ -43,7 +46,7 @@ def format_data(chains, mapping):
             if 'CA' not in residue: continue
 
             # get residue RSA
-            mask.append(residue.sasa/max_asa[rid])
+            masks.append(residue.sasa/max_asa[rid])
 
             # get CA coordinates to compute edges
             x, y, z = residue['CA'].get_coord()
@@ -55,116 +58,119 @@ def format_data(chains, mapping):
                 aid = atom.get_id()
                 atoms.append(atom_types[rid][aid]+[atom.sasa])
             while len(atoms) < 16: atoms.append(12*[0])
-            node.append(atoms)
-        
+            nodes.append(atoms)
+            
         # store point cloud and surface mask
-        masks.append(jnp.array(mask))
-        nodes.append(jnp.array(node))
-        clouds.append(jnp.array(cloud))
+        masks_pair.append(jnp.array(masks))
+        nodes_pair.append(jnp.array(nodes))
+        cloud_pair.append(jnp.array(cloud))
     
-    clouds, tgroup = initialize_clouds(clouds, 42)
+    if len(cloud_pair[0]) == 0 or len(cloud_pair[1]) == 0: 
+        print (f'Finished {code}')
+        return [code, None]
+
+    # always have largest protein first
+    if len(cloud_pair[1]) > len(cloud_pair[0]):
+        masks_pair = masks_pair[::-1]
+        nodes_pair = nodes_pair[::-1]
+        cloud_pair = cloud_pair[::-1]
+
+    # compute cmaps as edge features and bin-encode them
+    cloud1, cloud2 = cloud_pair    
     
-    # pad to the same length
-    max_len = max([len(mask_seq) for mask_seq in masks])
-    for idx in range(len(masks)):
-        pad = max_len - masks[idx].shape[0]
-        masks[idx] = jnp.concatenate(
-            [masks[idx], -jnp.ones([pad])], axis=0)
-        nodes[idx] = jnp.concatenate(
-            [nodes[idx], jnp.zeros([pad, 16, 12])], axis=0)
-        clouds[idx] = jnp.concatenate(
-            [clouds[idx], jnp.zeros([pad, 3])], axis=0)
+    cmap1 = cmap_from_cloud(cloud1[:,None,:], cloud1[None,:,:])
+    cmap2 = cmap_from_cloud(cloud2[:,None,:], cloud2[None,:,:])
+    edges_pair = [
+        one_hot_cmap(cmap1[:,:,None]), 
+        one_hot_cmap(cmap2[:,:,None])]
 
-    masks = jnp.array(masks)
-    nodes = jnp.array(nodes)
-    clouds = jnp.array(clouds)
-
-    # compute graph of real interfaces
-    sidx, ridx, edges_i = [], [], []
-    nodes_i = [i for i in range(len(chains))]
-    all_pairs = [[i,j] for i in nodes_i for j in nodes_i]
-    for i, j in all_pairs:
-        if i >= j: continue
-        cloudi = jnp.array([res['CA'].get_coord() for res in chains[i] \
-            if 'CA' in res and residue.get_resname() in standard_residues_three])
-        cloudj = jnp.array([res['CA'].get_coord() for res in chains[j] \
-            if 'CA' in res and residue.get_resname() in standard_residues_three])
-        cmap = jnp.sqrt(jnp.sum((cloudi[:, None, :]-cloudj[None, :, :])**2, axis=-1))
+    # compute interface true cmap
+    icmap = cmap_from_cloud(cloud1[:,None,:], cloud2[None,:,:])
         
-        if not jnp.any(cmap < 8): continue
+    # save original clouds
+    cloud_pair_real = [cloud1, cloud2]
 
-        edges_i += [cmap, jnp.transpose(cmap)]
-        ridx += [j, i]
-        sidx += [i, j]
+    # randomly rotate and center input clouds CoM to the origin
+    cloud_pair = [
+        initialize_clouds(cloud1, 42)[0], 
+        initialize_clouds(cloud2, 42)[0]]
 
-    igraph = jraph.GraphsTuple(
-            nodes=nodes_i, edges=edges_i,
-            senders=sidx, receivers=ridx,
-            n_node=len(nodes_i), n_edge=len(edges_i),
-            globals=None)
-        
-    return {'masks' : masks, 'nodes' : nodes, 'clouds' : clouds, 
-            'mapping' : mapping, 'igraph' : igraph}
+    #print (nodes_pair[0].shape, nodes_pair[1].shape, 
+    #       cloud_pair[0].shape, cloud_pair[1].shape,
+    #       edges_pair[0].shape, edges_pair[1].shape,
+    #       masks_pair[0].shape, masks_pair[1].shape,
+    #       cloud_pair_real[0].shape, cloud_pair_real[1].shape,
+    #       icmap.shape)
+
+    print (f'Finished {code}')
+    return [code, {'nodes':nodes_pair, 'clouds':cloud_pair,
+                 'edges':edges_pair, 'masks':masks_pair,
+                 'interface':icmap, 'orig_clouds':cloud_pair_real}]
     
 
-def compare_chains(chains):
-    mapping = {}
-    for nkey, chain in enumerate(chains):
-        seq = ''.join([three_to_one(res.get_resname()) for res in chain])
+def plot_dataset_stats(dataset, subset_paths):
+    data = {'pairsize':[], 'rec.size':[], 'lig.size':[], 
+            'icontacts4':[], 'icontacts6':[], 'icontacts8':[], 
+            'icontacts10':[], 'set':[]}
 
-        match = None
-        for okey in mapping:
-            if type(mapping[okey]) == int: continue
-            ali = pairwise2.align.globalds(seq, mapping[okey][0], blosum62, -11, -1)
-            ali = [str(ali[0][0]), str(ali[0][1])] 
+    for subset_path in subset_paths:
+        subset_id = subset_path.split('/')[-2]
+        paths = [line.rstrip() for line in glob.glob(subset_path)]
+        codes = [path.split('/')[-1].strip('_r_b.pdb').upper() for path in paths]
+        for code in codes:
+            if code not in dataset: continue
+            data['rec.size'].append(dataset[code]['clouds'][0].shape[0])
+            data['lig.size'].append(dataset[code]['clouds'][1].shape[0])
+            data['pairsize'].append(
+                dataset[code]['clouds'][0].shape[0]+
+                dataset[code]['clouds'][1].shape[0])
+            data['icontacts4'].append(int(jnp.sum(jnp.where(dataset[code]['interface']<=4, 1, 0))))
+            data['icontacts6'].append(int(jnp.sum(jnp.where(dataset[code]['interface']<=6, 1, 0))))
+            data['icontacts8'].append(int(jnp.sum(jnp.where(dataset[code]['interface']<=8, 1, 0))))
+            data['icontacts10'].append(int(jnp.sum(jnp.where(dataset[code]['interface']<=10, 1, 0))))
+            data['set'].append(subset_id)
 
-            while ali[0][0] == '-' or ali[1][0] == '-':
-                ali[0], ali[1] = ali[0][1:], ali[1][1:]
-            while ali[0][-1] == '-' or ali[1][-1] == '-':
-                ali[0], ali[1] = ali[0][:-1], ali[1][:-1]
-            seqid = sum([1. if a==b else 0. for a, b in zip(ali[0], ali[1])])
-            seqid /= len(ali[0])
-
-            if seqid >= 0.95: match = okey
-
-        if match:
-            if len(seq) > len(mapping[match][0]): 
-                mapping[nkey] = [seq, [chain.get_full_id()]+mapping[match][1]]
-                mapping[match] = nkey
-            else: 
-                mapping[match][1].append(chain.get_full_id())
-                mapping[nkey] = match
-        else: mapping[nkey] = [seq, [chain.get_full_id()]]
-
-    return mapping
-
+    f, ax = plt.subplots(3,2)
+    data = pd.DataFrame(data)
+    sb.kdeplot(x='rec.size', y='lig.size', data=data, hue='set', ax=ax[0][0])
+    sb.histplot(x='pairsize', data=data, hue='set', fill=False, ax=ax[0][1])
+    sb.histplot(x='icontacts6', data=data, hue='set', fill=False, ax=ax[1][1])
+    sb.histplot(x='icontacts8', data=data, hue='set', fill=False, ax=ax[2][0])
+    sb.histplot(x='icontacts10', data=data, hue='set', fill=False, ax=ax[2][1])
+    f.legend(prop={'size': 0.5})
+    plt.savefig('datasets.png')
 
 def main():
     pdbp = PDBParser(QUIET=True)
     cifp = MMCIFParser(QUIET=True)
 
-    data_path = '/home/pozzati/complex_assembly/data/benchmark5.5/*_r_b.pdb'
+    b5_path = '/home/pozzati/complex_assembly/data/benchmark5.5/*_r_b.pdb'
+    neg_path = '/home/pozzati/complex_assembly/data/negatome/*_r_b.pdb'
     output_path = '/home/pozzati/complex_assembly/data/train_features.pkl'
-    path_list = [line.rstrip() for line in glob.glob(data_path)][:10]
+    path_list = [line.rstrip() for line in glob.glob(b5_path)]
+    path_list += [line.rstrip() for line in glob.glob(neg_path)]
     
-    dataset = {}
+    
+    rec_list, lig_list, code_list = [], [], []
+    print ('Loading structures...')
     for path in path_list:
-        print (path)
-        pdb = path.split('/')[-1][0:4]
         path2 = path[:-7]+'l'+path[-6:]
-        structure1 = pdbp.get_structure(pdb, path)
-        structure2 = pdbp.get_structure(pdb, path2)
+        code_list.append(path.split('/')[-1].strip('_r_b.pdb').upper())
+        rec_list.append(pdbp.get_structure('', path))
+        lig_list.append(pdbp.get_structure('', path2))
+  
+    print ('Formatting...')
+    formatted_list = jax.tree_util.tree_map(format_data, 
+        code_list, rec_list, lig_list)
 
-        chains1 = unfold_entities(structure1, 'C')
-        chains2 = unfold_entities(structure2, 'C')
-        chains = chains1+chains2
-
-        mapping = compare_chains(chains)
-
-        dataset[pdb] = format_data(chains, mapping)
+    dataset = {}
+    for code, formatted_data in formatted_list:
+        if formatted_data: dataset[code] = formatted_data
     
     with open(output_path, 'wb') as out:
         pickle.dump(dataset, out)
+
+    plot_dataset_stats(dataset, [b5_path, neg_path])
 
 if __name__ == '__main__':
     main()

@@ -24,16 +24,16 @@ class DockingEnv():
 
         #self.n_rec = {pdb:dataset[pdb]['nodes'][0] for pdb in dataset}
         #self.e_rec = {pdb:dataset[pdb]['edges'][0] for pdb in dataset}
-        self.c_rec = {pdb:dataset[pdb]['clouds'][0] for pdb in dataset}        
+        self.c_rec = {pdb:dataset[pdb]['clouds'][0] for pdb in dataset}         
+
+        self.labels = {}
+        for pdb in dataset:
+            if dataset[pdb]['interface'].shape[0] == self.c_rec[pdb].shape[0]:
+                cmap = dataset[pdb]['interface']
+            else:
+                cmap = dataset[pdb]['interface'].transpose()
+            self.labels[pdb] = jnp.where((cmap<8) & (cmap>=3), 1, 0)
         
-        self.int = {
-            pdb:dataset[pdb]['interface'] \
-            if dataset[pdb]['interface'].shape[0] == self.c_rec.shape[0] \
-            else pdb:dataset[pdb]['interface'].transpose for pdb in dataset}
-        
-        self.int = {
-            pdb:jnp.where((cmap<8) & (cmap>=3), 1, 0) 
-            for pdb, cmap in self.int.items()}
 
     def reset(self, dataset):
         #self.n_lig = {pdb:dataset[pdb]['nodes'][1] for pdb in dataset}
@@ -68,15 +68,13 @@ class DockingEnv():
             
             def _one_cloud_step(cloud, action):
                 rot_cloud = quat_rotation(cloud, action[:,:4], self.substeps)
-                tr_cloud = rot_cloud+action[:,4:]
+                tr_cloud = rot_cloud+action[:,None,4:]
                 return tr_cloud
 
             return jax.tree_util.tree_map(_one_cloud_step, clouds, (actions))
 
-        def _get_reward(ligs, rec, label):
+        def _get_reward(ligs, rec, real):
             cmaps = cmap_from_cloud(rec[None,:,None,:], ligs[:,None,:,:])
-
-            real = jnp.where((label<8) & (label>=3), 1, 0)
 
             clash = jnp.sum(jnp.where(cmaps[:-1,:,:]<3, 1, 0))
             clash_l = jnp.sum(jnp.where(cmaps[-1,:,:]<3, 1, 0))
@@ -98,10 +96,10 @@ class DockingEnv():
 
             reward = (cont+delta)-clash/(2*self.substeps)+match-mismatch-clash_l
 
-            return [reward, cont_l]
+            return jnp.array([reward, cont_l])
 
         states = _step(actions)
-        evaluation = jax.tree_util.tree_map(_get_reward, states, (self.c_rec, self.int))
+        evaluation = jax.tree_util.tree_map(_get_reward, states, self.c_rec, self.labels)
         new_states = jax.tree_util.tree_map(lambda x: jnp.squeeze(x[-1]), states)
         rewards = jax.tree_util.tree_map(lambda x: x[0], evaluation)
         status = jax.tree_util.tree_map(lambda x: x[1], evaluation)
@@ -119,13 +117,13 @@ def main():
     with open(data_path, 'rb') as f:
         dataset = pickle.load(f)
 
+    dataset = {pdb:dataset[pdb] for n, pdb in enumerate(dataset) if n < 500}
     print (len(list(dataset.keys())),'examples')
-
+    
     env = DockingEnv(dataset, 42)
     env.reset(dataset)
 
     print (sys.getsizeof(env.c_lig))
-    sys.exit()
 
     t1 = time.perf_counter()
     action = env.sample()
@@ -133,13 +131,13 @@ def main():
     print ('Time to sample 1:', t2-t1)
 
     t1 = time.perf_counter()
-    s1 = env.step(action)
+    s1, r, st = env.step(action)
     t2 = time.perf_counter()
     print ('Step 0 time:', t2-t1)
 
     for n in range(10):
         t1 = time.perf_counter()
-        s = env.step(action)
+        s, r, st = env.step(action)
         t2 = time.perf_counter()
         print (f'Step {n+1} time:', t2-t1)
 

@@ -13,14 +13,12 @@ def matrix_from_quat(q):
 def cmap_from_cloud(matrix1, matrix2):
     return jnp.sqrt(jnp.sum((matrix1-matrix2)**2, axis=-1))
 
-def one_hot_cmap(cmap):
-    bin_size = 1
-    if len(cmap.shape) == 1: cmap = jnp.expand_dims(cmap, axis=-1)
+def one_hot_cmap(cmap, bin_size=1):
     ones, zeros = jnp.ones(cmap.shape), jnp.zeros(cmap.shape)
-    bmap = jnp.where(cmap>32, ones, zeros)
+    bmap = jnp.where(cmap>32, 1, 0)
     for n in range(32, 0, -bin_size):
-        next_bin = jnp.where((cmap<=n) & (cmap>n-bin_size), ones, zeros)
-        bmap = jnp.concatenate([bmap, zeros], axis=-1)
+        next_bin = jnp.where((cmap<=n) & (cmap>n-bin_size), 1, 0)
+        bmap = jnp.concatenate([next_bin, bmap], axis=-1)
     
     return bmap
 
