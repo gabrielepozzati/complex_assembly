@@ -9,21 +9,21 @@ from jax import jit
 from ops import *
 
 class DockingEnv():
-    def __init__(self, dataset, seed, substeps=10):
-        self.key = jax.random.PRNGKey(seed)
+    def __init__(self, dataset, PNRG, substeps=10):
+        self.key = PNRG
         self.list = list(dataset.keys())
         self.substeps = substeps
 
         self.lengths = {}
-        self.obs_spaces = {}
-        self.action_spaces = {}
         for pdb in dataset:
             self.lengths[pdb] = (
                 len(dataset[pdb]['clouds'][0]), 
                 len(dataset[pdb]['clouds'][1]))
 
-        #self.n_rec = {pdb:dataset[pdb]['nodes'][0] for pdb in dataset}
-        #self.e_rec = {pdb:dataset[pdb]['edges'][0] for pdb in dataset}
+        self.n_rec = {pdb:dataset[pdb]['nodes'][0] for pdb in dataset}
+        self.n_lig = {pdb:dataset[pdb]['nodes'][1] for pdb in dataset}
+        self.e_rec = {pdb:dataset[pdb]['edges'][0] for pdb in dataset}
+        self.e_lig = {pdb:dataset[pdb]['edges'][1] for pdb in dataset}
         self.c_rec = {pdb:dataset[pdb]['clouds'][0] for pdb in dataset}         
 
         self.labels = {}
@@ -36,12 +36,13 @@ class DockingEnv():
         
 
     def reset(self, dataset):
-        #self.n_lig = {pdb:dataset[pdb]['nodes'][1] for pdb in dataset}
-        #self.e_lig = {pdb:dataset[pdb]['edges'][1] for pdb in dataset}
         self.c_lig = {pdb:dataset[pdb]['clouds'][1] for pdb in dataset}
 
     @partial(jit, static_argnums=(0,))
     def sample(self,):
+        '''
+        sample action dataset wide
+        '''
         def _sample_rot():
             rot = jax.random.uniform(
                 self.key, shape=(len(self.list), self.substeps, 3),
@@ -63,6 +64,9 @@ class DockingEnv():
  
     @partial(jit, static_argnums=(0,))
     def step(self, actions):
+        def _compose_substeps(q1, q2):
+            
+            return action
 
         def _step(actions, clouds=self.c_lig):
             
@@ -106,6 +110,9 @@ class DockingEnv():
         return new_states, rewards, status
 
     def update(self, new_states):
+        '''
+        update actual ligand positions dataset-wide
+        '''
         def _single_update(state, pdb):
             self.c_lig[pdb] = state[-1]
 
@@ -124,22 +131,25 @@ def main():
     env.reset(dataset)
 
     print (sys.getsizeof(env.c_lig))
+    print (dataset.keys())
 
-    t1 = time.perf_counter()
-    action = env.sample()
-    t2 = time.perf_counter()
-    print ('Time to sample 1:', t2-t1)
+    action = jnp.array([10*[]])
 
-    t1 = time.perf_counter()
-    s1, r, st = env.step(action)
-    t2 = time.perf_counter()
-    print ('Step 0 time:', t2-t1)
+    #t1 = time.perf_counter()
+    #action = env.sample()
+    #t2 = time.perf_counter()
+    #print ('Time to sample 1:', t2-t1)
 
-    for n in range(10):
-        t1 = time.perf_counter()
-        s, r, st = env.step(action)
-        t2 = time.perf_counter()
-        print (f'Step {n+1} time:', t2-t1)
+    #t1 = time.perf_counter()
+    #s1, r, st = env.step(action)
+    #t2 = time.perf_counter()
+    #print ('Step 0 time:', t2-t1)
+
+    #for n in range(10):
+    #    t1 = time.perf_counter()
+    #    s, r, st = env.step(action)
+    #    t2 = time.perf_counter()
+    #    print (f'Step {n+1} time:', t2-t1)
 
 
 if __name__ == '__main__':

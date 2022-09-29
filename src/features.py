@@ -34,7 +34,9 @@ def format_data(code, str1, str2):
         try:
             sasa.compute(struc, level='R')
             sasa.compute(struc, level='A')
-        except: return [code, None]
+        except:
+            print (f'Failed {code}')
+            return [code, None]
         struc = unfold_entities(struc, 'R')
         
         masks, nodes, cloud = [], [], []
@@ -56,6 +58,9 @@ def format_data(code, str1, str2):
             atoms = []
             for atom in residue:
                 aid = atom.get_id()
+                if aid not in atom_types[rid]:
+                    print (f'Failed {code}')
+                    return [code, None]
                 atoms.append(atom_types[rid][aid]+[atom.sasa])
             while len(atoms) < 16: atoms.append(12*[0])
             nodes.append(atoms)
@@ -66,7 +71,7 @@ def format_data(code, str1, str2):
         cloud_pair.append(jnp.array(cloud))
     
     if len(cloud_pair[0]) == 0 or len(cloud_pair[1]) == 0: 
-        print (f'Finished {code}')
+        print (f'Failed {code}')
         return [code, None]
 
     # always have largest protein first
@@ -158,7 +163,7 @@ def main():
         code_list.append(path.split('/')[-1].strip('_r_b.pdb').upper())
         rec_list.append(pdbp.get_structure('', path))
         lig_list.append(pdbp.get_structure('', path2))
-  
+    
     print ('Formatting...')
     formatted_list = jax.tree_util.tree_map(format_data, 
         code_list, rec_list, lig_list)
