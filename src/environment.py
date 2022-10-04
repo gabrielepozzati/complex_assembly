@@ -62,11 +62,27 @@ class DockingEnv():
 
         return {pdb:step for pdb, step in zip(self.list, dataset_step)}
  
+    
     @partial(jit, static_argnums=(0,))
     def step(self, actions):
-        def _compose_substeps(q1, q2):
-            
-            return action
+
+        def _compose_substeps(action):
+
+            def _quat_composition(q1, q2):
+                y = quat_composition(q2, q1)
+                return y, y
+
+            def _tr_composition(tr1, tr2):
+                y = tr1+tr2
+                return y, y
+
+            composed_quat = jax.lax.scan(_quat_composition(),
+                jnp.array([1.,0.,0.,0.]), action[:,:4])
+
+            composed_tr = jax.lax.scan(_tr_composition(),
+                jnp.array([0.,0.,0.]), action[:,4:])
+
+            return jnp.concatenate((composed_quat, composed_tr) axis=-1)
 
         def _step(actions, clouds=self.c_lig):
             
@@ -74,10 +90,26 @@ class DockingEnv():
                 rot_cloud = quat_rotation(cloud, action[:,:4], self.substeps)
                 tr_cloud = rot_cloud+action[:,None,4:]
                 return tr_cloud
+            
+            geom_centers = jax.tree_util.tree_map(
+                    lambda x: jnp.sum(x, axis=0)/x.shape[0], 
+                    clouds)
 
-            return jax.tree_util.tree_map(_one_cloud_step, clouds, (actions))
+            ligand_frames = jax.tree_util.tree_map(
+                    lambda x, y: jnp.sum((x, -y[None,:])),
+                    clouds, mass_centers)
+
+            transformed = jax.tree_util.tree_map(_one_cloud_step, 
+                    ligand_frames, actions)
+
+            return jax.tree_util.tree_map(lambda x, y: jnp.sum((x, y[None,:])),
+                transformed, mass_centers))
 
         def _get_reward(ligs, rec, real):
+            '''
+            rec shape: (None, N_res, None, 3)
+            ligs shape: (substeps, None, N_res, 3)
+            '''
             cmaps = cmap_from_cloud(rec[None,:,None,:], ligs[:,None,:,:])
 
             clash = jnp.sum(jnp.where(cmaps[:-1,:,:]<3, 1, 0))
@@ -102,6 +134,7 @@ class DockingEnv():
 
             return jnp.array([reward, cont_l])
 
+        actions = jax.tree_util.tree_map(_compose_substeps, actions)
         states = _step(actions)
         evaluation = jax.tree_util.tree_map(_get_reward, states, self.c_rec, self.labels)
         new_states = jax.tree_util.tree_map(lambda x: jnp.squeeze(x[-1]), states)
@@ -135,21 +168,21 @@ def main():
 
     action = jnp.array([10*[]])
 
-    #t1 = time.perf_counter()
-    #action = env.sample()
-    #t2 = time.perf_counter()
-    #print ('Time to sample 1:', t2-t1)
+    t1 = time.perf_counter()
+    action = env.sample()
+    t2 = time.perf_counter()
+    print ('Time to sample 1:', t2-t1)
 
-    #t1 = time.perf_counter()
-    #s1, r, st = env.step(action)
-    #t2 = time.perf_counter()
-    #print ('Step 0 time:', t2-t1)
+    t1 = time.perf_counter()
+    s1, r, st = env.step(action)
+    t2 = time.perf_counter()
+    print ('Step 0 time:', t2-t1)
 
-    #for n in range(10):
-    #    t1 = time.perf_counter()
-    #    s, r, st = env.step(action)
-    #    t2 = time.perf_counter()
-    #    print (f'Step {n+1} time:', t2-t1)
+    for n in range(10):
+        t1 = time.perf_counter()
+        s, r, st = env.step(action)
+        t2 = time.perf_counter()
+        print (f'Step {n+1} time:', t2-t1)
 
 
 if __name__ == '__main__':

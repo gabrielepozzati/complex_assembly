@@ -115,8 +115,7 @@ def format_data(code, str1, str2):
 
 def plot_dataset_stats(dataset, subset_paths):
     data = {'pairsize':[], 'rec.size':[], 'lig.size':[], 
-            'icontacts4':[], 'icontacts6':[], 'icontacts8':[], 
-            'icontacts10':[], 'set':[]}
+            'icontacts6':[], 'icontacts8':[], 'set':[]}
 
     for subset_path in subset_paths:
         subset_id = subset_path.split('/')[-2]
@@ -129,20 +128,19 @@ def plot_dataset_stats(dataset, subset_paths):
             data['pairsize'].append(
                 dataset[code]['clouds'][0].shape[0]+
                 dataset[code]['clouds'][1].shape[0])
-            data['icontacts4'].append(int(jnp.sum(jnp.where(dataset[code]['interface']<=4, 1, 0))))
             data['icontacts6'].append(int(jnp.sum(jnp.where(dataset[code]['interface']<=6, 1, 0))))
             data['icontacts8'].append(int(jnp.sum(jnp.where(dataset[code]['interface']<=8, 1, 0))))
-            data['icontacts10'].append(int(jnp.sum(jnp.where(dataset[code]['interface']<=10, 1, 0))))
             data['set'].append(subset_id)
 
-    f, ax = plt.subplots(3,2)
+    f, ax = plt.subplots(2,2)
+    f.tight_layout(pad=2.0)
     data = pd.DataFrame(data)
-    sb.kdeplot(x='rec.size', y='lig.size', data=data, hue='set', ax=ax[0][0])
+    sb.kdeplot(x='rec.size', y='lig.size', data=data, hue='set', legend=False, ax=ax[0][0])
     sb.histplot(x='pairsize', data=data, hue='set', fill=False, ax=ax[0][1])
-    sb.histplot(x='icontacts6', data=data, hue='set', fill=False, ax=ax[1][1])
-    sb.histplot(x='icontacts8', data=data, hue='set', fill=False, ax=ax[2][0])
-    sb.histplot(x='icontacts10', data=data, hue='set', fill=False, ax=ax[2][1])
-    f.legend(prop={'size': 0.5})
+    sb.scatterplot(x='pairsize', y='icontacts6', data=data, hue='set', s=3, legend=False, ax=ax[1][0])
+    sb.scatterplot(x='pairsize', y='icontacts8', data=data, hue='set', s=3, legend=False, ax=ax[1][1])
+    ax[1][0].set_ylim([0, 200])
+    ax[1][1].set_ylim([0, 200])
     plt.savefig('datasets.png')
 
 def main():
@@ -175,7 +173,14 @@ def main():
     with open(output_path, 'wb') as out:
         pickle.dump(dataset, out)
 
+def main2():
+    b5_path = '/home/pozzati/complex_assembly/data/benchmark5.5/*_r_b.pdb'
+    neg_path = '/home/pozzati/complex_assembly/data/negatome/*_r_b.pdb'
+    output_path = '/home/pozzati/complex_assembly/data/train_features.pkl'
+    with open(output_path, 'rb') as data:
+        dataset = pickle.load(data)
+
     plot_dataset_stats(dataset, [b5_path, neg_path])
 
 if __name__ == '__main__':
-    main()
+    main2()

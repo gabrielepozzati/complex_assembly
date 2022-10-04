@@ -8,7 +8,6 @@ from typing import Sequence
 
 import flax
 import flax.linen as nn
-import gym
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -16,28 +15,13 @@ import optax
 import pybullet_envs  # noqa
 from flax.training.train_state import TrainState
 from stable_baselines3.common.buffers import ReplayBuffer
-from torch.utils.tensorboard import SummaryWriter
 
 
 def parse_args():
     # fmt: off
     parser = argparse.ArgumentParser()
-    parser.add_argument("--exp-name", type=str, default=os.path.basename(__file__).rstrip(".py"),
-        help="the name of this experiment")
     parser.add_argument("--seed", type=int, default=1,
         help="seed of the experiment")
-    parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
-        help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="cleanRL",
-        help="the wandb's project name")
-    parser.add_argument("--wandb-entity", type=str, default=None,
-        help="the entity (team) of wandb's project")
-    parser.add_argument("--capture-video", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
-        help="weather to capture videos of the agent performances (check out `videos` folder)")
-
-    # Algorithm specific arguments
-    parser.add_argument("--env-id", type=str, default="HalfCheetah-v2",
-        help="the id of the environment")
     parser.add_argument("--total-timesteps", type=int, default=1000000,
         help="total timesteps of the experiments")
     parser.add_argument("--learning-rate", type=float, default=3e-4,
@@ -63,36 +47,6 @@ def parse_args():
     return args
 
 
-# ALGO LOGIC: initialize agent here:
-class QNetwork(nn.Module):
-    @nn.compact
-    def __call__(self, x: jnp.ndarray, a: jnp.ndarray):
-        x = jnp.concatenate([x, a], -1)
-        x = nn.Dense(256)(x)
-        x = nn.relu(x)
-        x = nn.Dense(256)(x)
-        x = nn.relu(x)
-        x = nn.Dense(1)(x)
-        return x
-
-
-class Actor(nn.Module):
-    action_dim: Sequence[int]
-    action_scale: Sequence[int]
-    action_bias: Sequence[int]
-
-    @nn.compact
-    def __call__(self, x):
-        x = nn.Dense(256)(x)
-        x = nn.relu(x)
-        x = nn.Dense(256)(x)
-        x = nn.relu(x)
-        x = nn.Dense(self.action_dim)(x)
-        x = nn.tanh(x)
-        x = x * self.action_scale + self.action_bias
-        return x
-
-
 class TrainState(TrainState):
     target_params: flax.core.FrozenDict
 
@@ -108,83 +62,79 @@ if __name__ == "__main__":
     key, actor_key, qf1_key = jax.random.split(key, 3)
 
     # env setup
-    envs = DockingEnv(dataset, args.seed)
+    envs = DockingEnv(dataset, key)
 
-    max_action = float(envs.single_action_space.high[0])
-    envs.single_observation_space.dtype = np.float32
-    rb = ReplayBuffer(
+    r_buffer = ReplayBuffer(
         args.buffer_size,
-        envs.single_observation_space,
-        envs.single_action_space,
-        device="cpu",
-        handle_timeout_termination=True,
-    )
+        device="cpu")
 
     # TRY NOT TO MODIFY: start the game
     obs = envs.reset()
-    action_scale = np.array((envs.action_space.high - envs.action_space.low) / 2.0)
-    action_bias = np.array((envs.action_space.high + envs.action_space.low) / 2.0)
-    actor = Actor(
-        action_dim=np.prod(envs.single_action_space.shape),
-        action_scale=action_scale,
-        action_bias=action_bias,
-    )
-    qf1 = QNetwork()
+    actor = Actor()
+    crit = QNetwork()
+    
     actor_state = TrainState.create(
         apply_fn=actor.apply,
-        params=actor.init(actor_key, obs),
-        target_params=actor.init(actor_key, obs),
-        tx=optax.adam(learning_rate=args.learning_rate),
-    )
-    qf1_state = TrainState.create(
-        apply_fn=qf1.apply,
-        params=qf1.init(qf1_key, obs, envs.action_space.sample()),
-        target_params=qf1.init(qf1_key, obs, envs.action_space.sample()),
-        tx=optax.adam(learning_rate=args.learning_rate),
-    )
+        params=actor.init(),
+        target_params=actor.init(),
+        tx=optax.adam(learning_rate=args.learning_rate))
+
+    crit_state = TrainState.create(
+        apply_fn=crit.apply,
+        params=crit.init(),
+        target_params=crit.init(),
+        tx=optax.adam(learning_rate=args.learning_rate))
+
     actor.apply = jax.jit(actor.apply)
-    qf1.apply = jax.jit(qf1.apply)
+    crit.apply = jax.jit(crit.apply)
 
     @jax.jit
     def update_critic(
         actor_state: TrainState,
-        qf1_state: TrainState,
-        observations: np.ndarray,
+        crit_state: TrainState,
+        states: np.ndarray,
         actions: np.ndarray,
-        next_observations: np.ndarray,
         rewards: np.ndarray,
-        dones: np.ndarray,
-    ):
-        next_state_actions = (actor.apply(actor_state.target_params, next_observations)).clip(-1, 1)  # TODO: proper clip
-        qf1_next_target = qf1.apply(qf1_state.target_params, next_observations, next_state_actions).reshape(-1)
-        next_q_value = (rewards + (1 - dones) * args.gamma * (qf1_next_target)).reshape(-1)
+        next_states: np.ndarray):
+
+        next_action = actor.apply(actor_state.target_params, next_state)
+        next_q = crit.apply(crit_state.target_params, next_state, next_action)
+        y = reward + args.gamma * (next_q)
 
         def mse_loss(params):
-            qf1_a_values = qf1.apply(params, observations, actions).squeeze()
-            return ((qf1_a_values - next_q_value) ** 2).mean(), qf1_a_values.mean()
+            q = crit.apply(params, state, action)
+            return (y - q)**2, q
 
-        (qf1_loss_value, qf1_a_values), grads = jax.value_and_grad(mse_loss, has_aux=True)(qf1_state.params)
-        qf1_state = qf1_state.apply_gradients(grads=grads)
-        return qf1_state, qf1_loss_value, qf1_a_values
+        (crit_loss, q), grads = jax.value_and_grad(mse_loss, has_aux=True)(crit_state.params)
+        crit_state = crit_state.apply_gradients(grads=grads)
+        return crit_state, crit_loss, q
 
     @jax.jit
     def update_actor(
         actor_state: TrainState,
-        qf1_state: TrainState,
-        observations: np.ndarray,
-    ):
-        def actor_loss(params):
-            return -qf1.apply(qf1_state.params, observations, actor.apply(params, observations)).mean()
+        crit_state: TrainState,
+        states: np.ndarray):
 
-        actor_loss_value, grads = jax.value_and_grad(actor_loss)(actor_state.params)
+        def actor_loss(params):
+            return -crit.apply(crit_state.params, state, actor.apply(params, state)).mean()
+
+        actor_loss, grads = jax.value_and_grad(actor_loss)(actor_state.params)
+        
         actor_state = actor_state.apply_gradients(grads=grads)
+        
         actor_state = actor_state.replace(
-            target_params=optax.incremental_update(actor_state.params, actor_state.target_params, args.tau)
-        )
-        qf1_state = qf1_state.replace(
-            target_params=optax.incremental_update(qf1_state.params, qf1_state.target_params, args.tau)
-        )
-        return actor_state, qf1_state, actor_loss_value
+            target_params=optax.incremental_update(
+                actor_state.params, 
+                actor_state.target_params, 
+                args.tau))
+
+        crit_state = crit_state.replace(
+            target_params=optax.incremental_update(
+                crit_state.params, 
+                crit_state.target_params, 
+                args.tau))
+
+        return actor_state, crit_state, actor_loss
 
     start_time = time.time()
     for global_step in range(args.total_timesteps):

@@ -1,15 +1,20 @@
 import jax
 import jax.numpy as jnp
-import psutil
 
 class ReplayBuffer():
-    def __init__(self, env, buffer_size = 1e5, device = 'cpu'):
+    def __init__(self, env, max_size, device = 'cpu'):
         self.env = env
-        self.buffer_size = buffer_size
-       
+        self.actual_size = 0
+        self.max_size = max_size
+        self.data = {pdb:[] for pdb in self.env.keys()}        
 
     def fill(self):
-        
+        while self.actual_size < self.max_size:
+            actions = env.sample()
+            new_state, reward, contacts = env.step(actions) 
+
+
+            self.actual_size += 1
 
     def add(self):
 
