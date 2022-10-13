@@ -1,8 +1,21 @@
 import os
 import sys
+import jax
 import jraph
 import jax.numpy as jnp
 import pdb as debug
+
+@jax.jit
+def surface_edges(edges, surf_mask):
+  surf_idx = jnp.where(surf_mask>=0.2, 1, 0)
+  surf_idx = surf_idx[None, :]*surf_idx[:,None]
+  masked_edges = edges*surf_idx
+  idxs = jnp.indices(masked_edges.shape).transpose(1,2,0)
+  sort_idxs = jnp.flip(jnp.argsort(masked_edges, axis=None), axis=0)
+  masked_edges = jnp.ravel(masked_edges)[sort_idxs]
+  idxs = idxs.reshape((edges.shape[0]**2, 2))[sort_idxs].transpose()
+  return masked_edges, jnp.squeeze(idxs[0]), jnp.squeeze(idxs[1])
+
 
 def distance_subgraph(graph, thr=8):
   
@@ -20,6 +33,7 @@ def distance_subgraph(graph, thr=8):
       senders=graph.senders[receptive_field],
       receivers=graph.receivers[receptive_field],
       n_node=graph.n_node, n_edge=len(graph.edges[receptive_field]))
+
 
 def surface_subgraph(graph, surf_mask):
   

@@ -48,33 +48,48 @@ def matrix_from_quat(q):
          [2*b*c+2*a*d, aa-bb+cc-dd, 2*c*d-2*a*b],
          [2*b*d-2*a*c, 2*c*d+2*a*b, aa-bb-cc+dd]])
 
+@jax.jit
 def cmap_from_cloud(matrix1, matrix2):
     return jnp.sqrt(jnp.sum((matrix1-matrix2)**2, axis=-1))
 
-def one_hot_cmap(cmap, bin_size=1):
-    ones, zeros = jnp.ones(cmap.shape), jnp.zeros(cmap.shape)
-    bmap = jnp.where(cmap>32, 1, 0)
-    for n in range(32, 0, -bin_size):
-        next_bin = jnp.where((cmap<=n) & (cmap>n-bin_size), 1, 0)
-        bmap = jnp.concatenate([next_bin, bmap], axis=-1)
-    
-    return bmap
+@jax.jit
+def one_hot_distances(distances, bin_size=1):
+    last = jnp.where(distances>32, 1, 0)
+    bins = jnp.arange(32,0,-bin_size)
+    one_hot = [jnp.where((distances<=n) & (distances>n-bin_size), 1, 0) for n in bins]
+    return jnp.flip(jnp.stack([last]+one_hot, axis=-1), axis=-1)
 
-def quat_rotation(cloud, q, substeps):
+def quat_rotation(cloud, q):
     #quaternion coordinates
     zeros = jnp.zeros((cloud.shape[0], 1))
     p = jnp.concatenate((zeros, cloud), axis=-1)
     p = hamilton_multiplier(p)
 
     #inverse quaternion
-    q_i = jnp.concatenate((q[:,:1], -q[:,1:]), axis=-1)
+    q_i = jnp.concatenate((q[:1], -q[1:]), axis=-1)
     q_i = hamilton_multiplier(q_i)
 
-    qp = quat_product(q[:,None,None,:], p[None,:,:,:])
-    return quat_product(qp[:,:,None,:], q_i[:,None,:,:])[:,:,1:]
+    qp = quat_product(q[None,None,:], p[:,:,:])
+    return quat_product(qp[:,None,:], q_i[None,:,:])[:,1:]
 
 def hamilton_multiplier(q):
-    return jnp.sum(q[:,:,None,None]*H_MASK[None,:,:,:], axis=1)
+    return jnp.sum(q[:,None,None]*H_MASK[:,:,:], axis=0)
+
+#def quat_rotation(cloud, q, substeps):
+#    #quaternion coordinates
+#    zeros = jnp.zeros((cloud.shape[0], 1))
+#    p = jnp.concatenate((zeros, cloud), axis=-1)
+#    p = hamilton_multiplier(p)
+#
+#    #inverse quaternion
+#    q_i = jnp.concatenate((q[:,:1], -q[:,1:]), axis=-1)
+#    q_i = hamilton_multiplier(q_i)
+#
+#    qp = quat_product(q[:,None,None,:], p[None,:,:,:])
+#    return quat_product(qp[:,:,None,:], q_i[:,None,:,:])[:,:,1:]
+#
+#def hamilton_multiplier(q):
+#    return jnp.sum(q[:,:,None,None]*H_MASK[None,:,:,:], axis=1)
 
 def quat_product(q1, q2):
     return jnp.sum(q1*q2, axis=-1)

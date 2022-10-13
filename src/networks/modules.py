@@ -141,8 +141,9 @@ class MultiLayerPerceptron(hk.Module):
     for layer in self.stack:
       x = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
       x = jax.nn.relu(layer(x))
-
-    return self.out_layer(x)
+      
+    x = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
+    return jax.nn.relu(self.out_layer(x))
 
 
 class MultiHeadAttention(hk.Module):
@@ -613,8 +614,22 @@ class InvariantPointAttention(hk.Module):
         initializer=final_init,
         name='output_projection')(final_act)
 
+class GraphEncoding(hk.Module):
+    def __init__(self, num_channels, name='GE'):
+        super().__init__(name=name)
+        n_enc1 = Linear(2**7, num_input_dims=2)
+        n_enc2 = MultiLayerPerceptron(num_channels, num_channels, 1)
+        e_enc = MultiLayerPerceptron(2**5, num_channels, 2)
 
-class GraphUpdates():
+    def __call__(g):
+        n_rec = n_enc1(g.nodes)
+        n_rec = n_enc2(n_rec)
+        e_rec = e_enc(g.edges)
+        
+        return g.replace(nodes=n_rec, edges=e_rec)
+
+
+class GraphUpdates(hk.Module):
     def __init__(self, num_channels, name='GU'):
         super().__init__(name=name)
         self.edge_updates = MultiLayerPerceptron(num_channels, num_channels, 1)
@@ -642,6 +657,27 @@ class GraphUpdates():
         globals_ = jnp.concatenate([nodes, edges], axis=-1)
         return self.global_updates(globals_)
 
+
+class AttentionGraphStack(hk.Module):
+    def __init__(self, num_channels, num_heads, node_a=True, edge_a=True, name='GA'):
+        super().__init__(name=name)
+        self.node_a = node_a
+        self.edge_a = edge_a
+        if node_a: self.node_a = MultiHeadAttention(num_heads, num_channels)
+        if edge_a: self.edge_a = MultiHeadAttention(num_heads, num_channels)
+        self.graph_up = GraphUpdates(num_channels)
+
+    def __call__(g1, g2=None):
+        if not g2: g2 = g1
+        if node_a: 
+            nodes = g1.nodes+self.node_a(g1.nodes, g2.nodes, g2.nodes)
+            nodes = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(nodes)
+            g1 = g1.replace(nodes=nodes)
+        if edge_a:
+            edges = g1.edges+self.edge_a(g1.edges, g2.edges, g2.edges)
+            edges = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(edges)
+            g1 = g1.replace(edges=edges)
+        return self.graph_up(g1)
 
 def get_closest_edges(cloud, mask, e_enc, n=10):
     surf_mask = jnp.ravel(jnp.where(mask>0.2, 1, 10e6))

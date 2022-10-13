@@ -9,15 +9,10 @@ from jax import jit
 from ops import *
 
 class DockingEnv():
-    def __init__(self, dataset, PNRG):
+    def __init__(self, dataset, PNRG, substeps=10):
         self.key = PNRG
         self.list = list(dataset.keys())
-
-        self.visit_lookup = {
-                pdb:jnp.zeros((dataset[pdb]['clouds'][0].shape[0],
-                               dataset[pdb]['clouds'][1].shape[0])) \
-                for pdb in dataset}
-
+        self.substeps = substeps
 
         self.l_rec = {len(dataset[pdb]['clouds'][0]) for pdb in dataset}
         self.l_lig = {len(dataset[pdb]['clouds'][1]) for pdb in dataset}
@@ -41,59 +36,111 @@ class DockingEnv():
 
 
     @partial(jit, static_argnums=(0,))
-    def step(self, actions, confidence):
+    def sample(self,):
+        '''
+        sample action dataset wide
+        '''
+        def _sample_rot():
+            rot = jax.random.uniform(
+                self.key, shape=(len(self.list), self.substeps, 3),
+                minval=-1, maxval=1)
+            ones = jnp.ones((len(self.list), self.substeps, 1))
+            rot = jnp.concatenate((rot, ones), axis=-1)
+            rot = rot/jnp.sqrt(jnp.sum(rot**2, axis=-1))[:,:,None]
+            return rot
 
-        def _step(actions, clouds):
+        def _sample_tr():
+            return jax.random.uniform(
+                self.key, shape=(len(self.list), self.substeps, 3),
+                minval=-10, maxval=10)
+        
+        dataset_step = jnp.concatenate(
+            (_sample_rot(), _sample_tr()), axis=-1)
+
+        return {pdb:step for pdb, step in zip(self.list, dataset_step)}
+ 
+    
+    @partial(jit, static_argnums=(0,))
+    def step(self, actions):
+
+        def _compose_substeps(action):
+
+            def _quat_composition(q1, q2):
+                y = quat_composition(q2, q1)
+                return y, y
+
+            def _tr_composition(tr1, tr2):
+                y = tr1+tr2
+                return y, y
+
+            composed_quat = jax.lax.scan(_quat_composition(),
+                jnp.array([1.,0.,0.,0.]), action[:,:4])
+
+            composed_tr = jax.lax.scan(_tr_composition(),
+                jnp.array([0.,0.,0.]), action[:,4:])
+
+            return jnp.concatenate((composed_quat, composed_tr) axis=-1)
+
+        def _step(actions, clouds=self.c_lig):
             
             def _one_cloud_step(cloud, action):
-                rot_cloud = quat_rotation(cloud, action[:4], self.substeps)
-                tr_cloud = rot_cloud+action[None,4:-1]
+                rot_cloud = quat_rotation(cloud, action[:,:4], self.substeps)
+                tr_cloud = rot_cloud+action[:,None,4:]
                 return tr_cloud
             
             geom_centers = jax.tree_util.tree_map(
                     lambda x: jnp.sum(x, axis=0)/x.shape[0], 
                     clouds)
 
-            ligand_frames = jax.tree_util.tree_map(lambda x, y: x-y[None,:],
-                    clouds, geom_centers)
+            ligand_frames = jax.tree_util.tree_map(
+                    lambda x, y: jnp.sum((x, -y[None,:])),
+                    clouds, mass_centers)
 
             transformed = jax.tree_util.tree_map(_one_cloud_step, 
                     ligand_frames, actions)
 
-            return jax.tree_util.tree_map(lambda x, y: x+y[None,:],
-                    transformed, geom_centers)
+            return jax.tree_util.tree_map(lambda x, y: jnp.sum((x, y[None,:])),
+                transformed, mass_centers))
 
+        def _get_reward(ligs, rec, real=self.labels):
+            '''
+            rec shape: (None, N_res, None, 3)
+            ligs shape: (substeps, None, N_res, 3)
+            '''
+            cmaps = cmap_from_cloud(rec[None,:,None,:], ligs[:,None,:,:])
+
+            clash = jnp.sum(jnp.where(cmaps[:-1,:,:]<3, 1, 0))
+            clash_l = jnp.sum(jnp.where(cmaps[-1,:,:]<3, 1, 0))
+
+            cont = jnp.where((cmaps[:-1,:,:]<8) & (cmaps[:-1,:,:]>=3), 1, 0)
+            cont_l = jnp.where((cmaps[-1,:,:]<8) & (cmaps[-1,:,:]>=3), 1, 0)
+
+            i_prev, i_next = -1*cont[:-1,:,:], cont[1:,:,:]
+            delta = jnp.sum(jnp.concatenate((i_prev, i_next), axis=-1))
+            delta = jnp.where(delta>0, 1, 0)
+            delta += delta*real[None,:,:]
+            delta = jnp.sum(delta)
+
+            match = jnp.sum(jnp.where((cont_l==1) & (real==1), 1, 0))
+            mismatch = jnp.sum(jnp.where((cont_l==1) & (real==0), 1, 0))
+
+            cont_l = jnp.sum(cont_l)
+            cont = jnp.sum(cont+(cont*real[None,:,:]))
+
+            reward = (cont+delta)-clash/(2*self.substeps)+match-mismatch-clash_l
+
+            return [cmaps[-1,:,:], reward, cont_l]
+
+        actions = jax.tree_util.tree_map(_compose_substeps, actions)
+        states = _step(actions)
+        evaluation = jax.tree_util.tree_map(_get_reward, states, self.c_rec, self.labels)
         
-        def _get_reward(new_lig, old_lig, rec, real, table, confidence):
-            old_cmap = cmap_from_cloud(rec[:,None,:], old_lig[None,:,:])
-            new_cmap = cmap_from_cloud(rec[:,None,:], new_lig[None,:,:])
+        self.c_lig = jax.tree_util.tree_map(lambda x: jnp.squeeze(x[-1]), states)
+        self.contacts = jax.tree_util.tree_map(lambda x: x[0], evaluation)
 
-            clashes = jnp.sum(jnp.where(new_cmaps<3, 1, 0))
-
-            old_cont = jnp.where((old_cmaps<8) & (old_cmaps>=3), 1, 0)
-            new_cont = jnp.where((new_cmaps<8) & (new_cmaps>=3), 1, 0)
-            delta = jnp.where((new_cmaps==1) & (old_cmaps==0), 1, 0)
-            table += delta
-            delta = jnp.sum(delta*jnp.clip(
-                        1/2**(8+table), a_min=0.00001, a_max=0,001))
-
-            match = jnp.sum(jnp.where((new_cont==1) & (real==1), 1, 0))
-            mismatch = jnp.sum(jnp.where((new_cont==1) & (real==0), 1, 0))
-            
-            final_reward = (match-(mismatch+clashes))*confidence
-            inner_reward = delta-(clashes*(1-confidence))-jnp.min(new_cmap)
-            return [inner_reward+final_reward, new_cmap, table]
-
-        new_ligs = _step(actions, self.c_lig)
-        evaluation = jax.tree_util.tree_map(
-                _get_reward, new_ligs, self.c_lig, self.c_rec, 
-                self.labels, self.visit_lookup, confidence)
-        
-        self.c_lig = jax.tree_util.tree_map(lambda x: x, new_ligs)
-        self.contacts = jax.tree_util.tree_map(lambda x: x[1], evaluation)
-        self.visit_lookup = jax.tree_util.tree_map(lambda x: x[2], evaluation)
-
-        return jax.tree_util.tree_map(lambda x: x[0], evaluation)
+        rewards = jax.tree_util.tree_map(lambda x: x[1], evaluation)
+        status = jax.tree_util.tree_map(lambda x: x[2], evaluation)
+        return rewards, status
 
     def get_state(self, thr=8):
         # surface/interface mask
