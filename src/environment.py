@@ -19,8 +19,8 @@ class DockingEnv():
                 for pdb in dataset}
 
 
-        self.l_rec = {len(dataset[pdb]['clouds'][0]) for pdb in dataset}
-        self.l_lig = {len(dataset[pdb]['clouds'][1]) for pdb in dataset}
+        self.l_rec = {pdb:len(dataset[pdb]['clouds'][0]) for pdb in dataset}
+        self.l_lig = {pdb:len(dataset[pdb]['clouds'][1]) for pdb in dataset}
 
         self.m_rec = {pdb:jnp.where(dataset[pdb]['masks'][0]>=0.2, 0, 10) \
                 for pdb in dataset}
@@ -30,7 +30,9 @@ class DockingEnv():
         self.g_lig = {pdb:dataset[pdb]['graphs'][1] for pdb in dataset}
         self.c_rec = {pdb:dataset[pdb]['clouds'][0] for pdb in dataset}         
 
-        self.labels = {pdb:jnp.where((cmap<8) & (cmap>=3), 1, 0) for pdb in dataset}
+        self.labels = {pdb:jnp.where(
+            (dataset[pdb]['interface']<8) & (dataset[pdb]['interface']>=3), 
+            1, 0) for pdb in dataset}
 
 
     def reset(self, dataset):
@@ -75,7 +77,7 @@ class DockingEnv():
             delta = jnp.where((new_cmaps==1) & (old_cmaps==0), 1, 0)
             table += delta
             delta = jnp.sum(delta*jnp.clip(
-                        1/2**(8+table), a_min=0.00001, a_max=0,001))
+                        1/2**(8+table), a_min=0.00001, a_max=0.001))
 
             match = jnp.sum(jnp.where((new_cont==1) & (real==1), 1, 0))
             mismatch = jnp.sum(jnp.where((new_cont==1) & (real==0), 1, 0))
@@ -108,7 +110,7 @@ class DockingEnv():
         
         iedges = jax.tree_util.tree_map(
                 lambda x, y, z: x[y,z], self.contacts, rec_idx, lig_idx)
-        iedges = jax.tree_util.tree_map(one_hot_distances(), iedges)
+        iedges = jax.tree_util.tree_map(one_hot_distances, iedges)
         iedges = jax.tree_util.tree_map(
                 lambda x: jnp.concatenate(
                     (x,
@@ -117,9 +119,11 @@ class DockingEnv():
                      jnp.ones((x.shape[0], 1))), axis=-1), iedges)
 
         isender = jax.tree_util.tree_map(
-                lambda x: x-self.l_rec-self.l_lig, rec_idx)
+                lambda x, y, z: x-y-z, 
+                rec_idx, self.l_rec, self.l_lig)
+        
         ireceiver = jax.tree_util.tree_map(
-                lambda x: x-self.l_lig, lig_idx)
+                lambda x, y: x-y, lig_idx, self.l_lig)
         
         # non-surface/non-interface indexes
         def _get_noninterface_edges(contacts, surf_masks, 

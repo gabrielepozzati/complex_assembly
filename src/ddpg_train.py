@@ -1,31 +1,42 @@
 # derived from https://docs.cleanrl.dev/rl-algorithms/ddpg
 import os
 import time
+import glob
 import random
 import argparse
+import pickle as pkl
 from distutils.util import strtobool
 from typing import Sequence
 
 import jax
 import flax
 import optax
+import haiku as hk
 import jax.numpy as jnp
 import flax.linen as nn
+from jax import tree_util
 from flax.training.train_state import TrainState
 from networks.critic import Critic
-from networks.agent import Agent
+from networks.actor import Actor
 from replay_buffer import *
 from environment import *
 from ops import *
 
+tree_util.register_pytree_node(
+        Experience,
+        Experience._tree_flatten,
+        Experience._tree_unflatten)
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--seed", type=int, default=1,
+    parser.add_argument("--path", type=str, 
+        default='/home/pozzati/complex_assembly/data/dataset_features/',
+        help="data path")
+    parser.add_argument("--seed", type=int, default=42,
         help="seed of the experiment")
-    parser.add_argument("--episodes", type=int, default=1000000,
+    parser.add_argument("--steps", type=int, default=100,
         help="total number of episodes")
-    parser.add_argument("--substeps", type=int, default=100,
+    parser.add_argument("--episode", type=int, default=10,
         help="total number of substeps")
     parser.add_argument("--learning-rate", type=float, default=3e-4,
         help="the learning rate of the optimizer")
@@ -57,36 +68,64 @@ class TrainState(TrainState):
 
 if __name__ == "__main__":
     args = parse_args()
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+
+    dataset = {}
+    for idx, path in enumerate(glob.glob(args.path+'/*')):
+        code = path.split('/')[-1].rstrip('.pkl')
+        with open(path, 'br') as f: dataset[code] = pkl.load(f)
+        if idx == 9: break
 
     # seeding
     random.seed(args.seed)
     key = jax.random.PRNGKey(args.seed)
     key, env_key, buff_key = jax.random.split(key, 3)
+    key, act_key, crit_key = jax.random.split(key, 3)
 
     # env setup
     envs = DockingEnv(dataset, env_key)
-    envs.reset()
-    obs = envs.get_state()
+    envs.reset(dataset)
 
     r_buffer = ReplayBuffer(
         envs, args.buffer_size, buff_key)
 
     actor = hk.transform(Actor)
     critic = hk.transform(Critic)
-    actor.apply = jax.jit(actor.apply)
-    crit.apply = jax.jit(crit.apply)
+    actor_apply = jax.jit(actor.apply)
+    critc_apply = jax.jit(critic.apply)
+    
+    # init actor parameters
+    obs = envs.get_state()
+    actor_params = actor.init(
+            act_key, 
+            envs.g_rec[code][0], 
+            envs.g_lig[code][0], 
+            obs[code])
 
+    # init critic parameters
+    action = actor_apply(
+            actor_params,
+            envs.g_rec[code][0],
+            envs.g_lig[code][0],
+            obs[code])
+
+    critic_params = critic.init(
+            crit_key,
+            envs.g_rec[code][0],
+            envs.g_lig[code][0],
+            obs[code],
+            action)
+
+    # duplicate and group actor/critic params
     actor_state = TrainState.create(
-        apply_fn=actor.apply,
-        params=actor.init(),
-        target_params=actor.init(),
+        apply_fn=actor_apply,
+        params=actor_params,
+        target_params=actor_params,
         tx=optax.adam(learning_rate=args.learning_rate))
 
     critic_state = TrainState.create(
-        apply_fn=crit.apply,
-        params=crit.init(),
-        target_params=crit.init(),
+        apply_fn=critic_apply,
+        params=critic_params,
+        target_params=critic_params,
         tx=optax.adam(learning_rate=args.learning_rate))
 
     @jax.jit
@@ -137,11 +176,14 @@ if __name__ == "__main__":
 
         return actor_state, crit_state, actor_loss
 
+    obs = envs.get_state()    
     start_time = time.time()
-    for global_step in range(args.total_episodes):
+    for global_step in range(args.steps):
         
-        # run actor
-        actions = actor.apply(actor_state.params, (envs.g_rec, envs.g_lig, obs))
+        # run actor network
+        actions = jax.tree_util.tree_map(
+                functools.partial(actor_apply, actor_state.params),
+                envs.g_rec, envs.g_lig, obs)
         
         # add noise to action
         key_dic1, key_dic2 = {}, {}
@@ -172,7 +214,8 @@ if __name__ == "__main__":
         obs = next_obs
 
         # training
-        if global_step > args.learning_starts:
+        #if global_step > args.learning_starts:
+        if False:
             data = r_buffer.sample(args.batch_size)
             qf1_state, qf1_loss_value, qf1_a_values = update_critic(
                 actor_state,
@@ -189,5 +232,4 @@ if __name__ == "__main__":
                     qf1_state,
                     data.observations.numpy(),
                 )
-
-    envs.close()
+        if args.steps % args.episode: envs.reset(dataset)

@@ -1,7 +1,7 @@
 def Critic(num_heads: int, num_channels: int):
     """Create the model's forward pass."""
 
-    def forward_fn(graphs, action) -> jnp.ndarray:
+    def forward_fn(graphs, g_rec, g_lig, g_int, action) -> jnp.ndarray:
         """Forward pass."""
         ################################
         ##### layers/modules definitions
@@ -25,7 +25,7 @@ def Critic(num_heads: int, num_channels: int):
         value = Linear(1)
 
         ####### START MODEL #######
-        g_rec, g_lig, g_int = graphs
+
         action = action_encoding(action)
 
         # receptor/ligand encoding
@@ -55,7 +55,7 @@ def Critic(num_heads: int, num_channels: int):
                 (g_rec.senders, g_lig.senders, g_int.senders), axis=0)
         all_receivers = jnp.concatenate(
                 (g_rec.receivers, g_lig.receivers, g_int.receivers), axis=0)
-        agg_globals = jnp.sum((g_rec.globals,g_lig.globals,g_int.globals) axis=0)
+        agg_globals = jnp.sum((g_rec.globals,g_lig.globals,g_int.globals), axis=0)
 
         g_int = jraph.GraphsTuple(
                 nodes=all_nodes+g_int.nodes, edges=all_edges,
