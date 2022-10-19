@@ -1,47 +1,48 @@
-def Actor(num_heads: int, num_channels: int):
-    """Create the model's forward pass."""
+import haiku as hk
+from networks.modules import *
 
-    def forward_fn(g_rec, g_lig, g_int) -> jnp.ndarray:
-        """Forward pass."""
-        ################################
-        ##### layers/modules definitions
+class Actor(hk.Module):
+ 
+    def __init__(self, num_heads, num_channels):
+        super().__init__(name='Actor')
+
         #base node/edge encoding
-        encoding = GraphEncoding(num_channels)
+        self.encoding = GraphEncoding(num_channels)
 
-        # surface encoding 
-        single_stack = [AttentionGraphStack(num_heads, num_channels) \
-                for n in range(4)]
+        # surface encoding
+        self.single_stack = [AttentionGraphStack(num_heads, num_channels) \
+                for n in range(4)] 
 
-        interaction_stack = [AttentionGraphStack(num_heads, num_channels) \
+        self.interaction_stack = [AttentionGraphStack(num_heads, num_channels) \
                 for n in range(4)]
 
         # pair encoding
-        pair_stack = [[AttentionGraphStack(num_heads, num_channels),
-                       AttentionGraphStack(num_heads, num_channels)] \
-                for n in range(4)]
+        self.pair_stack = [[AttentionGraphStack(num_heads, num_channels),
+            AttentionGraphStack(num_heads, num_channels)] \
+                    for n in range(8)]
 
         # transformation graph updates
-        docking_stack = [AttentionGraphStack(num_heads, num_channels) \
-                for n in range(8)]
+        self.docking_stack = [AttentionGraphStack(num_heads, num_channels) \
+                for n in range(8)] 
 
         # roto-traslation output
-        out_rblock = MultiLayerPerceptron(num_channels, num_channels, 1)
-        out_tblock = MultiLayerPerceptron(num_channels, num_channels, 1)
-        traslator = Linear(3)
-        rotator = Linear(3)
+        self.out_rblock = MultiLayerPerceptron(num_channels, num_channels, 1)
+        self.out_tblock = MultiLayerPerceptron(num_channels, num_channels, 1)
+        self.traslator = Linear(3)
+        self.rotator = Linear(3)
 
         # confidence output
-        out_cblock = MultiLayerPerceptron(num_channels, num_channels, 1)
-        confidence = Linear(1)
+        self.out_cblock = MultiLayerPerceptron(num_channels, num_channels, 1)
+        self.confidence = Linear(1)
 
-        ####### START MODEL #######
-
+    def __call__(self, g_rec, g_lig, g_int):
+        print (type(g_rec))
         # receptor/ligand encoding
-        g_rec = encoding(g_rec)
-        g_lig = encoding(g_lig)
+        g_rec = self.encoding(g_rec)
+        g_lig = self.encoding(g_lig)
 
         # elaborate surface level info
-        for module in single_stack:
+        for module in self.single_stack:
             g_rec = module(g_rec)
             g_lig = module(g_lig)
 
@@ -49,10 +50,10 @@ def Actor(num_heads: int, num_channels: int):
         g_int = g_int.replace(
                 nodes=jnp.concatenate((g_rec.nodes, g_lig.nodes), axis=0),
                 edges=encoding.e_enc(g_int.edges))
-        for module in interaction_stack: g_int = module(g_int)
+        for module in self.interaction_stack: g_int = module(g_int)
 
         # elaborate mutual surface info
-        for module1, module2 in pair_stack:
+        for module1, module2 in self.pair_stack:
             g_rec = module1(g_rec, g_lig)
             g_lig = module2(g_lig, g_rec)
 
@@ -73,18 +74,17 @@ def Actor(num_heads: int, num_channels: int):
                 globals=agg_globals)
 
         # elaborate all info to derive final global feature
-        for module in docking_stack: g_int = module(g_int)
+        for module in self.docking_stack: g_int = module(g_int)
         
         # elaborate final global feature to rot. and trasl.
-        out_r = out_rblock(g_int.globals)
-        out_t = out_tblock(g_int.globals+out_r)
-        out_t = traslator(out_t)
-        out_r = jnp.tanh(rotator(out_r))
+        out_r = self.out_rblock(g_int.globals)
+        out_t = self.out_tblock(g_int.globals+out_r)
+        out_t = self.traslator(out_t)
+        out_r = jnp.tanh(self.rotator(out_r))
 
-#        # elaborate confidence estimation
-#        out_c = out_cblock(g_int.globals)
-#        out_c = jax.sigmoid(confidence(out_c))
+        # elaborate confidence estimation
+        out_c = self.out_cblock(g_int.globals)
+        out_c = jax.sigmoid(self.confidence(out_c))
 
-        return jnp.concatenate((out_r, out_t), axis=-1)
-    return forward_fn
+        return jnp.concatenate((out_r, out_t, out_c), axis=-1)
 

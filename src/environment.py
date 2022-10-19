@@ -1,7 +1,8 @@
 import sys
 import jax
 import time
-import dill as pickle
+import jraph
+import pickle
 import jax.numpy as jnp
 from functools import partial
 from jax import jit
@@ -19,8 +20,8 @@ class DockingEnv():
                 for pdb in dataset}
 
 
-        self.l_rec = {pdb:len(dataset[pdb]['clouds'][0]) for pdb in dataset}
-        self.l_lig = {pdb:len(dataset[pdb]['clouds'][1]) for pdb in dataset}
+        self.l_rec = {pdb:dataset[pdb]['clouds'][0].shape[0] for pdb in dataset}
+        self.l_lig = {pdb:dataset[pdb]['clouds'][1].shape[0] for pdb in dataset}
 
         self.m_rec = {pdb:jnp.where(dataset[pdb]['masks'][0]>=0.2, 0, 10) \
                 for pdb in dataset}
@@ -98,6 +99,9 @@ class DockingEnv():
         return jax.tree_util.tree_map(lambda x: x[0], evaluation)
 
     def get_state(self, thr=8):
+
+        i_sign = jnp.array((0,0,1))
+
         # surface/interface mask
         surf_masks = jax.tree_util.tree_map(
                 lambda x, y: x[:,None]+y[None,:], self.m_rec, self.m_lig)
@@ -112,33 +116,34 @@ class DockingEnv():
                 lambda x, y, z: x[y,z], self.contacts, rec_idx, lig_idx)
         iedges = jax.tree_util.tree_map(one_hot_distances, iedges)
         iedges = jax.tree_util.tree_map(
-                lambda x: jnp.concatenate(
-                    (x,
-                     jnp.zeros((x.shape[0], 1)),
-                     jnp.zeros((x.shape[0], 1)),
-                     jnp.ones((x.shape[0], 1))), axis=-1), iedges)
+                lambda x: jnp.concatenate((x, jnp.broadcast_to(i_sign, (x.shape[0], 3))), axis=-1), iedges)
 
-        isender = jax.tree_util.tree_map(
+        isenders = jax.tree_util.tree_map(
                 lambda x, y, z: x-y-z, 
                 rec_idx, self.l_rec, self.l_lig)
         
-        ireceiver = jax.tree_util.tree_map(
+        ireceivers = jax.tree_util.tree_map(
                 lambda x, y: x-y, lig_idx, self.l_lig)
         
         # non-surface/non-interface indexes
         def _get_noninterface_edges(contacts, surf_masks, 
-                                    downscales1, downscales2):
+                                    downscales1, downscales2, reverse=False):
+            if reverse:
+                contacts = jax.tree_util.tree_map(lambda x: x.transpose(), contacts)
+
             senders = jax.tree_util.tree_map(
-                    lambda x, y, z: jnp.where(jnp.min(x+y[:,None], axis=1)>thr)-z,
-                    contacts, surf_masks, downscales1)
+                    lambda x, y: jnp.ravel(jnp.argwhere(jnp.min(x+y[:,None], axis=1)>thr)),
+                    contacts, surf_masks)
 
             receivers = jax.tree_util.tree_map(
-                    lambda x, y, z: jnp.argmin(x[y,:], axis=1)-z, 
-                    contacts, senders, downscales2)
-            
-            edges = jax.tree_util.tree_map(
-                    lambda x, y, z: x[y,z], contacts, senders, receivers)
-        
+                    lambda x, y: jnp.argmin(x[y,:], axis=1), 
+                    contacts, senders)
+
+            edges = jax.tree_util.tree_map(lambda x, y, z: x[y,z], contacts, senders, receivers)
+
+            senders = jax.tree_util.tree_map(lambda x, y: x-y, senders, downscales1)
+            receivers = jax.tree_util.tree_map(lambda x, y: x-y, receivers, downscales2)
+
             return edges, senders, receivers
         
         def _concat_across_dic(i, r, l):
@@ -157,18 +162,22 @@ class DockingEnv():
                 self.contacts, self.m_rec, 
                 self.l_rec, self.l_lig)
         ledges, lsenders, lreceivers = _get_noninterface_edges(
-                self.contacts.transpose(), self.m_lig, 
-                self.l_lig, self.l_rec)
+                self.contacts, self.m_lig, 
+                self.l_lig, self.l_rec, reverse=True)
 
-        redges = jax.tree_util.tree_map(one_hot_distances(), redges)
-        ledges = jax.tree_util.tree_map(one_hot_distances(), ledges)
+        redges = jax.tree_util.tree_map(one_hot_distances, redges)
+        redges = jax.tree_util.tree_map(
+                lambda x: jnp.concatenate((x, jnp.broadcast_to(i_sign, (x.shape[0], 3))), axis=-1), redges)
+
+        ledges = jax.tree_util.tree_map(one_hot_distances, ledges)
+        ledges = jax.tree_util.tree_map(
+                lambda x: jnp.concatenate((x, jnp.broadcast_to(i_sign, (x.shape[0], 3))), axis=-1), ledges)
 
         all_edges = _concat_across_dic(iedges, redges, ledges)
         all_senders = _concat_across_dic(isenders, rsenders, lsenders)
         all_receivers = _concat_across_dic(ireceivers, rreceivers, lreceivers)
         
-        return jax.tree_util.tree_map(_interface_graph(),
-                all_edges, all_senders, all_receivers)
+        return jax.tree_util.tree_map(_interface_graph, all_edges, all_senders, all_receivers)
 
 def main():
     data_path = '/home/pozzati/complex_assembly/data/train_features.pkl'

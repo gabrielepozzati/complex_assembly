@@ -6,16 +6,13 @@ import random
 import argparse
 import pickle as pkl
 from distutils.util import strtobool
-from typing import Sequence
 
 import jax
-import flax
 import optax
 import haiku as hk
 import jax.numpy as jnp
-import flax.linen as nn
 from jax import tree_util
-from flax.training.train_state import TrainState
+from typing import Sequence, Iterable, Mapping, NamedTuple, Tuple
 from networks.critic import Critic
 from networks.actor import Actor
 from replay_buffer import *
@@ -62,19 +59,61 @@ def parse_args():
     return args
 
 
-class TrainState(TrainState):
-    target_params: flax.core.FrozenDict
+class TrainState(NamedTuple):
+    params: hk.Params
+    target_params: hk.Params
+    state: hk.State
+    opt_state: optax.OptState
 
+def load_dataset(path):
+    dataset = {}
+    for idx, path in enumerate(glob.glob(path+'/*')):
+        code = path.split('/')[-1].rstrip('.pkl')
+        f = open(path, 'br')
+        data = pkl.load(f)
+
+        # restore device array type
+        for lbl in ['clouds', 'orig_clouds', 'masks']:
+            data[lbl] = (jnp.array(data[lbl][0]),jnp.array(data[lbl][1]))
+        
+        data['interface'] = jnp.array(data['interface'])
+        
+        g1, g2 = data['graphs']
+        print (type(g1), type(g2))
+
+        data['graphs'] = (jraph.GraphsTuple(
+                            nodes=jnp.array(g1.nodes), 
+                            edges=jnp.array(g1.edges), 
+                            senders=jnp.array(g1.senders), 
+                            receivers=jnp.array(g1.receivers),
+                            n_node=jnp.array(g1.n_node), 
+                            n_edge=jnp.array(g1.n_edge), 
+                            globals=jnp.array(g1.globals)),
+                          jraph.GraphsTuple(
+                            nodes=jnp.array(g2.nodes),
+                            edges=jnp.array(g2.edges), 
+                            senders=jnp.array(g2.senders),
+                            receivers=jnp.array(g2.receivers),
+                            n_node=jnp.array(g2.n_node),
+                            n_edge=jnp.array(g2.n_edge),
+                            globals=jnp.array(g2.globals)))
+
+        dataset[code] = data
+        if idx == 2: break
+    return dataset, code
+
+def actor_fw(g_rec, g_lig, g_int):
+    actor = Actor(8, 64)
+    return actor(g_rec, g_lig, g_int)
 
 if __name__ == "__main__":
     args = parse_args()
 
-    dataset = {}
-    for idx, path in enumerate(glob.glob(args.path+'/*')):
-        code = path.split('/')[-1].rstrip('.pkl')
-        with open(path, 'br') as f: dataset[code] = pkl.load(f)
-        if idx == 9: break
-
+    s = time.time()
+    print ('Data loading -', time.time()-s)
+    dataset, code = load_dataset(args.path)
+ 
+    print ('Initializing -', time.time()-s)
     # seeding
     random.seed(args.seed)
     key = jax.random.PRNGKey(args.seed)
@@ -88,22 +127,26 @@ if __name__ == "__main__":
     r_buffer = ReplayBuffer(
         envs, args.buffer_size, buff_key)
 
-    actor = hk.transform(Actor)
+    actor = hk.transform(actor_fw)
     critic = hk.transform(Critic)
-    actor_apply = jax.jit(actor.apply)
-    critc_apply = jax.jit(critic.apply)
+    apply_actor = jax.jit(actor.apply)
+    apply_critic = jax.jit(critic.apply)
     
     # init actor parameters
+    print ('Computing first state -', time.time()-s)
     obs = envs.get_state()
-    actor_params = actor.init(
+
+    print (type(envs.g_rec[code]))
+    print ('Initializing parameters -', time.time()-s)
+    a_params = actor.init(
             act_key, 
-            envs.g_rec[code][0], 
-            envs.g_lig[code][0], 
+            envs.g_rec[code],
+            envs.g_lig[code],
             obs[code])
 
     # init critic parameters
-    action = actor_apply(
-            actor_params,
+    action = apply_actor(
+            a_params, act_key,
             envs.g_rec[code][0],
             envs.g_lig[code][0],
             obs[code])

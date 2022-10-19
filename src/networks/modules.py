@@ -165,7 +165,7 @@ class MultiHeadAttention(hk.Module):
     self.num_heads = num_heads
     self.key_size = key_size
     self.value_size = value_size or key_size
-    self.model_size = model_size or key_size * num_heads
+    self.model_size = model_size or key_size
     #self.w_init = hk.initializers.VarianceScaling(w_init_scale)
 
   def __call__(
@@ -174,19 +174,16 @@ class MultiHeadAttention(hk.Module):
       key: jnp.ndarray,
       value: jnp.ndarray) -> jnp.ndarray:
 
-    """Compute (optionally masked) MHA with queries, keys & values."""
-    #print ('Pre', query.shape, key.shape, value.shape)
-    query_heads = self._linear_projection(query, self.key_size, "query")
-    key_heads = self._linear_projection(key, self.key_size, "key")
-    value_heads = self._linear_projection(value, self.value_size, "value")
-    #print ('Post', query_heads.shape, key_heads.shape, value_heads.shape)
+    query_heads = self._linear_projection(query, self.key_size)
+    key_heads = self._linear_projection(key, self.key_size)
+    value_heads = self._linear_projection(value, self.value_size)
 
     attn_logits = jnp.einsum("...thd,...Thd->...htT", query_heads, key_heads)
-    sqrt_key_size = jnp.sqrt(self.key_size).astype(key.dtype)
-    attn_logits = attn_logits / sqrt_key_size
+    attn_logits = attn_logits / jnp.sqrt(self.key_size).astype(key.dtype)
 
     attn_weights = jax.nn.softmax(attn_logits)
     attn = jnp.einsum("...htT,...Thd->...thd", attn_weights, value_heads)
+    
     # Concatenate attention matrix of all heads into a single vector.
     attn_vec = jnp.reshape(attn, (*query.shape[:-1], -1))
 
@@ -617,16 +614,16 @@ class InvariantPointAttention(hk.Module):
 class GraphEncoding(hk.Module):
     def __init__(self, num_channels, name='GE'):
         super().__init__(name=name)
-        n_enc1 = Linear(2**7, num_input_dims=2)
-        n_enc2 = MultiLayerPerceptron(num_channels, num_channels, 1)
-        e_enc = MultiLayerPerceptron(2**5, num_channels, 2)
+        self.n_enc1 = Linear(2**7, num_input_dims=2)
+        self.n_enc2 = MultiLayerPerceptron(num_channels, num_channels, 1)
+        self.e_enc = MultiLayerPerceptron(2**5, num_channels, 2)
 
-    def __call__(g):
-        n_rec = n_enc1(g.nodes)
-        n_rec = n_enc2(n_rec)
-        e_rec = e_enc(g.edges)
+    def __call__(self, g):
+        n_rec = self.n_enc1(g.nodes)
+        n_rec = self.n_enc2(n_rec)
+        e_rec = self.e_enc(g.edges)
         
-        return g.replace(nodes=n_rec, edges=e_rec)
+        return g._replace(nodes=n_rec, edges=e_rec)
 
 
 class GraphUpdates(hk.Module):
@@ -636,9 +633,9 @@ class GraphUpdates(hk.Module):
         self.node_updates = MultiLayerPerceptron(num_channels, num_channels, 1)
         self.global_updates = MultiLayerPerceptron(num_channels, num_channels, 1)
         self.graph_update = GraphNetwork(
-            self.up_edges(), 
-            self.up_nodes(),
-            update_global_fn=self.up_global())
+            self.up_edges, 
+            self.up_nodes,
+            update_global_fn=self.up_global)
 
     def __call__(self, g):
         return self.graph_update(g)
@@ -659,24 +656,26 @@ class GraphUpdates(hk.Module):
 
 
 class AttentionGraphStack(hk.Module):
-    def __init__(self, num_channels, num_heads, node_a=True, edge_a=True, name='GA'):
+    def __init__(self, num_heads, num_channels, node_a=True, edge_a=True, name='GA'):
         super().__init__(name=name)
         self.node_a = node_a
         self.edge_a = edge_a
         if node_a: self.node_a = MultiHeadAttention(num_heads, num_channels)
         if edge_a: self.edge_a = MultiHeadAttention(num_heads, num_channels)
+        self.node_LN = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)
+        self.edge_LN = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)
         self.graph_up = GraphUpdates(num_channels)
 
-    def __call__(g1, g2=None):
+    def __call__(self, g1, g2=None):
         if not g2: g2 = g1
-        if node_a: 
+        if self.node_a: 
             nodes = g1.nodes+self.node_a(g1.nodes, g2.nodes, g2.nodes)
-            nodes = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(nodes)
-            g1 = g1.replace(nodes=nodes)
-        if edge_a:
+            nodes = self.node_LN(nodes)
+            g1 = g1._replace(nodes=nodes)
+        if self.edge_a:
             edges = g1.edges+self.edge_a(g1.edges, g2.edges, g2.edges)
-            edges = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(edges)
-            g1 = g1.replace(edges=edges)
+            edges = self.edge_LN(edges)
+            g1 = g1._replace(edges=edges)
         return self.graph_up(g1)
 
 def get_closest_edges(cloud, mask, e_enc, n=10):
@@ -714,6 +713,6 @@ class RelativeSurfaceEncoding():
     up_nodes1 = []
     for node in nodes1:
       node = jnp.expand_dims(node, axis=0)
-      up_nodes1.append(self.inter_chain_comp(node, nodes2, nodes2)
+      up_nodes1.append(self.inter_chain_comp(node, nodes2, nodes2))
     return jnp.concatenate(up_nodes1, axis=0)
 
