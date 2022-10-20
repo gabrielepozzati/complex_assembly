@@ -23,37 +23,23 @@ class ReplayBuffer():
 class Experience:
     def __init__(self, 
             prev_state, next_state,
-            action, reward, confidence):
+            action, reward):
         
         self.prev_state = prev_state
         self.next_state = next_state
         self.action = action
         self.reward = reward
-        self.confidence = confidence
-
-    def _tree_flatten(self):
-        dyn = (self.prev_state,
-                 self.next_state,
-                 self.action,
-                 self.reward,
-                 self.confidence)
-        stat = {}
-        return (dyn, stat)
-
-    @classmethod
-    def _tree_unflatten(cls, stat, dyn):
-        return cls(*dyn, **stat)
 
 class Experience_List:
     def __init__(self, max_size):
         self.list = ()
         self.actual_size = 0
-        self.max_sixe = max_size
+        self.max_size = max_size
 
     def add(self, experience):
         if self.actual_size == self.max_size:
-            self.list[1:] += experience
+            self.list[1:] += (experience,)
         else:
-            self.list += experience
+            self.list += (experience,)
             self.actual_size += 1
 

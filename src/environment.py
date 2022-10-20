@@ -9,6 +9,10 @@ from jax import jit
 
 from ops import *
 
+class GWrapper():
+    def __init__(self, g):
+        self.g = g
+
 class DockingEnv():
     def __init__(self, dataset, PNRG):
         self.key = PNRG
@@ -44,12 +48,12 @@ class DockingEnv():
 
 
     @partial(jit, static_argnums=(0,))
-    def step(self, actions, confidence):
+    def step(self, actions):
 
         def _step(actions, clouds):
             
             def _one_cloud_step(cloud, action):
-                rot_cloud = quat_rotation(cloud, action[:4], self.substeps)
+                rot_cloud = quat_rotation(cloud, action[:4])
                 tr_cloud = rot_cloud+action[None,4:-1]
                 return tr_cloud
             
@@ -59,6 +63,7 @@ class DockingEnv():
 
             ligand_frames = jax.tree_util.tree_map(lambda x, y: x-y[None,:],
                     clouds, geom_centers)
+            
 
             transformed = jax.tree_util.tree_map(_one_cloud_step, 
                     ligand_frames, actions)
@@ -67,36 +72,39 @@ class DockingEnv():
                     transformed, geom_centers)
 
         
-        def _get_reward(new_lig, old_lig, rec, real, table, confidence):
-            old_cmap = cmap_from_cloud(rec[:,None,:], old_lig[None,:,:])
-            new_cmap = cmap_from_cloud(rec[:,None,:], new_lig[None,:,:])
+        def _get_reward(new_cmap, new_cont, real, diff, lookup, action):
+            confidence = action[-1]
+            
+            clashes = jnp.sum(jnp.where(new_cmap<3, 1, 0))
 
-            clashes = jnp.sum(jnp.where(new_cmaps<3, 1, 0))
-
-            old_cont = jnp.where((old_cmaps<8) & (old_cmaps>=3), 1, 0)
-            new_cont = jnp.where((new_cmaps<8) & (new_cmaps>=3), 1, 0)
-            delta = jnp.where((new_cmaps==1) & (old_cmaps==0), 1, 0)
-            table += delta
-            delta = jnp.sum(delta*jnp.clip(
-                        1/2**(8+table), a_min=0.00001, a_max=0.001))
+            diff = jnp.sum(diff*jnp.clip(
+                        1/2**(8+lookup), a_min=0.00001, a_max=0.001))
 
             match = jnp.sum(jnp.where((new_cont==1) & (real==1), 1, 0))
             mismatch = jnp.sum(jnp.where((new_cont==1) & (real==0), 1, 0))
             
             final_reward = (match-(mismatch+clashes))*confidence
-            inner_reward = delta-(clashes*(1-confidence))-jnp.min(new_cmap)
-            return [inner_reward+final_reward, new_cmap, table]
+            inner_reward = diff-(clashes*(1-confidence))-jnp.min(new_cmap)
+            return inner_reward+final_reward
 
         new_ligs = _step(actions, self.c_lig)
-        evaluation = jax.tree_util.tree_map(
-                _get_reward, new_ligs, self.c_lig, self.c_rec, 
-                self.labels, self.visit_lookup, confidence)
+        new_cmaps = jax.tree_util.tree_map(
+                lambda x, y: cmap_from_cloud(x[:,None,:], y[None,:,:]), self.c_rec, new_ligs)
         
-        self.c_lig = jax.tree_util.tree_map(lambda x: x, new_ligs)
-        self.contacts = jax.tree_util.tree_map(lambda x: x[1], evaluation)
-        self.visit_lookup = jax.tree_util.tree_map(lambda x: x[2], evaluation)
+        old_cont = jax.tree_util.tree_map(
+                lambda x: jnp.where((x<8) & (x>=3), 1, 0), self.contacts)
+        new_cont = jax.tree_util.tree_map(
+                lambda x: jnp.where((x<8) & (x>=3), 1, 0), new_cmaps)
+        diff_contacts = jax.tree_util.tree_map(
+                lambda x, y: jnp.where((x==1) & (y==0), 1, 0), new_cont, old_cont)
+        updated_lookup = jax.tree_util.tree_map(
+                lambda x, y: x+y, self.visit_lookup, diff_contacts)
 
-        return jax.tree_util.tree_map(lambda x: x[0], evaluation)
+        reward = jax.tree_util.tree_map(
+                _get_reward, new_cmaps, new_cont, self.labels, 
+                diff_contacts, self.visit_lookup, actions)
+        
+        return reward, new_ligs, new_cmaps, updated_lookup
 
     def get_state(self, thr=8):
 
@@ -152,11 +160,11 @@ class DockingEnv():
 
         def _interface_graph(edges, senders, receivers):
             n_edges = jnp.array(senders.shape[0])
-            return jraph.GraphsTuple(
-                    nodes=jnp.array([]), edges=edges,
-                    senders=senders, receivers=receivers,
-                    n_node=jnp.array([0]), n_edge=n_edges,
-                    globals=[1,1])
+            return GWrapper(jraph.GraphsTuple(
+                        nodes=jnp.array([]), edges=edges,
+                        senders=senders, receivers=receivers,
+                        n_node=jnp.array([0]), n_edge=n_edges,
+                        globals=[1,1]))
 
         redges, rsenders, rreceivers = _get_noninterface_edges(
                 self.contacts, self.m_rec, 

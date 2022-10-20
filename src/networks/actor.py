@@ -10,19 +10,20 @@ class Actor(hk.Module):
         self.encoding = GraphEncoding(num_channels)
 
         # surface encoding
-        self.single_stack = [AttentionGraphStack(num_heads, num_channels) \
+        self.single_stack = [AttentionGraphStack(num_heads, num_channels, edge_a=False) \
                 for n in range(4)] 
 
         self.interaction_stack = [AttentionGraphStack(num_heads, num_channels) \
                 for n in range(4)]
 
         # pair encoding
-        self.pair_stack = [[AttentionGraphStack(num_heads, num_channels),
-            AttentionGraphStack(num_heads, num_channels)] \
-                    for n in range(8)]
+        self.pair_stack = [
+                [AttentionGraphStack(num_heads, num_channels, edge_a=False),
+                 AttentionGraphStack(num_heads, num_channels, edge_a=False)] \
+                for n in range(8)]
 
         # transformation graph updates
-        self.docking_stack = [AttentionGraphStack(num_heads, num_channels) \
+        self.docking_stack = [AttentionGraphStack(num_heads, num_channels, edge_a=False) \
                 for n in range(8)] 
 
         # roto-traslation output
@@ -36,7 +37,6 @@ class Actor(hk.Module):
         self.confidence = Linear(1)
 
     def __call__(self, g_rec, g_lig, g_int):
-        print (type(g_rec))
         # receptor/ligand encoding
         g_rec = self.encoding(g_rec)
         g_lig = self.encoding(g_lig)
@@ -47,9 +47,9 @@ class Actor(hk.Module):
             g_lig = module(g_lig)
 
         # elaborate interface level info
-        g_int = g_int.replace(
+        g_int = g_int._replace(
                 nodes=jnp.concatenate((g_rec.nodes, g_lig.nodes), axis=0),
-                edges=encoding.e_enc(g_int.edges))
+                edges=self.encoding.e_enc(g_int.edges))
         for module in self.interaction_stack: g_int = module(g_int)
 
         # elaborate mutual surface info
@@ -65,12 +65,13 @@ class Actor(hk.Module):
                 (g_rec.senders, g_lig.senders, g_int.senders), axis=0)
         all_receivers = jnp.concatenate(
                 (g_rec.receivers, g_lig.receivers, g_int.receivers), axis=0)
-        agg_globals = jnp.sum((g_rec.globals,g_lig.globals), axis=0)
+        agg_globals = g_rec.globals+g_lig.globals
 
         g_int = jraph.GraphsTuple(
                 nodes=all_nodes+g_int.nodes, edges=all_edges,
                 senders=all_senders, receivers=all_receivers,
-                n_node=all_nodes.shape[0], n_edge=all_edges.shape[0],
+                n_node=jnp.array([all_nodes.shape[0]]), 
+                n_edge=jnp.array([all_edges.shape[0]]),
                 globals=agg_globals)
 
         # elaborate all info to derive final global feature
@@ -84,7 +85,7 @@ class Actor(hk.Module):
 
         # elaborate confidence estimation
         out_c = self.out_cblock(g_int.globals)
-        out_c = jax.sigmoid(self.confidence(out_c))
+        out_c = jax.nn.sigmoid(self.confidence(out_c))
 
         return jnp.concatenate((out_r, out_t, out_c), axis=-1)
 
