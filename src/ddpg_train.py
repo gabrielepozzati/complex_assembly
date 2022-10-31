@@ -64,7 +64,7 @@ def load_dataset(path):
         data = pkl.load(f)
 
         # restore device array type
-        for lbl in ['clouds', 'orig_clouds', 'masks']:
+        for lbl in ['clouds', 'orig_clouds', 'smasks', 'bmasks']:
             data[lbl] = (jnp.array(data[lbl][0]),jnp.array(data[lbl][1]))
         
         data['interface'] = jnp.array(data['interface'])
@@ -139,8 +139,8 @@ if __name__ == "__main__":
 
     a_params = actor.init(
             act_key, 
-            envs.g_rec[code],
-            envs.g_lig[code],
+            envs.graph_rec[code],
+            envs.graph_lig[code],
             unwrapped_obs[code])
     print ('Initialized actor -', time.time()-s)
     s = time.time()
@@ -148,8 +148,8 @@ if __name__ == "__main__":
     # init critic parameters
     action = a_apply(
             a_params, act_key,
-            envs.g_rec[code],
-            envs.g_lig[code],
+            envs.graph_rec[code],
+            envs.graph_lig[code],
             unwrapped_obs[code])
     print ('Computed first action -', time.time()-s)
     s = time.time()
@@ -157,8 +157,8 @@ if __name__ == "__main__":
     
     c_params = critic.init(
             crit_key,
-            envs.g_rec[code],
-            envs.g_lig[code],
+            envs.graph_rec[code],
+            envs.graph_lig[code],
             unwrapped_obs[code],
             action)
     print ('Initialized critic -', time.time()-s)
@@ -231,7 +231,7 @@ if __name__ == "__main__":
 
         actions = jax.tree_util.tree_map(
                 functools.partial(a_apply, actor_state.params),
-                key_dic1, envs.g_rec, envs.g_lig, unwrapped_obs)
+                key_dic1, envs.graph_rec, envs.graph_lig, unwrapped_obs)
         
         # add noise to action
         actions = jax.tree_util.tree_map(
@@ -248,7 +248,9 @@ if __name__ == "__main__":
         s = time.time()
 
         # execute action and get reward
-        rewards, envs.c_lig, envs.contacts, envs.lookup_table = envs.step(actions)
+        rewards, envs.cloud_lig, envs.contacts, envs.visit_lookup = envs.step(actions)
+        envs.scloud_lig = envs.mask_filter(envs.cloud_lig, envs.smask)
+        envs.bcloud_lig = envs.mask_filter(envs.cloud_lig, envs.bmask)
         print ('Computed reward -', time.time()-s)
         s = time.time()
 

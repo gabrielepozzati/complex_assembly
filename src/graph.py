@@ -2,20 +2,29 @@ import os
 import sys
 import jax
 import jraph
+import functools
 import jax.numpy as jnp
 import pdb as debug
 
 @jax.jit
-def surface_edges(edges, surf_mask):
-  surf_idx = jnp.where(surf_mask>=0.2, 1, 0)
-  surf_idx = surf_idx[None, :]*surf_idx[:,None]
-  masked_edges = edges*surf_idx
-  idxs = jnp.indices(masked_edges.shape).transpose(1,2,0)
-  sort_idxs = jnp.flip(jnp.argsort(masked_edges, axis=None), axis=0)
-  masked_edges = jnp.ravel(masked_edges)[sort_idxs]
-  idxs = idxs.reshape((edges.shape[0]**2, 2))[sort_idxs].transpose()
-  return masked_edges, jnp.squeeze(idxs[0]), jnp.squeeze(idxs[1])
+def surface_edges(edges, idx_map):
+  
+  def _residue_edges(line):
 
+    def _next_lowest(min_val, array):
+      array = jnp.where(array>min_val, array, array+10e6)
+      next_val = jnp.min(array)
+      return next_val, jnp.argwhere(array==next_val, size=1)
+    
+    sorting_input = jnp.broadcast_to(line[None,:], (4, line.shape[0]))
+    sorted_idxs = jnp.squeeze(jax.lax.scan(_next_lowest, 0, sorting_input)[1])
+    sorted_line = line[sorted_idxs]
+    return sorted_line, sorted_idxs
+  
+  senders = jnp.indices((edges.shape[0],))[0]
+  senders = jnp.broadcast_to(senders[:,None], (edges.shape[0], 4))
+  edges, receivers = jax.vmap(_residue_edges, in_axes=0, out_axes=0)(edges)
+  return jnp.ravel(edges), jnp.ravel(idx_map[senders]), jnp.ravel(idx_map[receivers])
 
 def distance_subgraph(graph, thr=8):
   
