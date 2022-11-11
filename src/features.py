@@ -37,7 +37,7 @@ def pad(array, axes=1, size=1000):
 def filter_surface(array, surf_mask):
     return jnp.stack([line for line, asa in zip(array, surf_mask) if asa>=0.2], axis=0)
 
-def format_data(code, str1, str2):
+def format_data(code, str1, str2, key, enum=4, pad=1000):
     s = time.time()
     structures = [str1, str2]
     masks_pair, nodes_pair, cloud_pair = [], [], [] 
@@ -59,7 +59,7 @@ def format_data(code, str1, str2):
             if 'CA' not in residue: continue
 
             # get residue RSA
-            masks.append(residue.sasa/max_asa[rid])
+            masks.append(max(residue.sasa/max_asa[rid], 1e-3))
 
             # get CA coordinates to compute edges
             x, y, z = residue['CA'].get_coord()
@@ -67,15 +67,16 @@ def format_data(code, str1, str2):
 
             # get atom types/ASA to compute node features
             atoms = []
-            for atom in residue:
-                aid = atom.get_id()
-                if aid not in atom_types[rid]: continue
-                atoms += atom_types[rid][aid]+[atom.sasa]
-            while len(atoms) < 16: atoms += 12*[0]
-            if idx == 0: nodes += atoms + [1,0]
-            else: nodes += atoms + [0,1]
+            for atom in standard_atoms:
+                if atom not in residue: atoms.append(0)
+                else: atoms.append(max(residue[atom].sasa, 1e-3))
+            if idx == 0: nodes.append(atoms+[1,0])
+            else: nodes.append(atoms+[0,1])
         
-        if len(masks) > 1000: 
+        while len(nodes) < pad: 
+            nodes.append([0]*(len(standard_atoms)+2))
+
+        if len(masks) > pad: 
             print (f'Sequence too long!')
             return [code, None]
         
@@ -88,86 +89,87 @@ def format_data(code, str1, str2):
         print (f'One empty struct. in {code}')
         return [code, None]
 
-    # always have largest protein first
-    if len(cloud_pair[1]) > len(cloud_pair[0]):
-        masks_pair = masks_pair[::-1]
-        nodes_pair = nodes_pair[::-1]
-        cloud_pair = cloud_pair[::-1]
     print ('Collect', time.time()-s)
 
     # compute cmaps as edge features and bin-encode them
-    mask1, mask2 = masks_pair
+    #mask1 = jnp.array([0.3,0.4,0.6,0.3])
+    #mask2 = jnp.array([0.3,0.4,0.1])
+    #cloud1 = jnp.array([[1,0,0],[2,0,0],[10,0,0],[50,0,0]])
+    #cloud2 = jnp.array([[25,0,0],[100,0,0],[15,0,0]])
+
+    s = time.time()
     cloud1, cloud2 = cloud_pair
-    #mask1 = jnp.array([0.1,0.3,0.4,0.1,0.6,0.3,0.4,0.4])
-    #cloud1 = jnp.array([[1,2,3],[1,0,0],[2,0,0],[1,2,3],[10,0,0],[50,0,0],[25,0,0],[100,0,0]])
-
-    s = time.time()
-    surf_cloud1 = filter_surface(cloud1, mask1)
-    surf_cloud2 = filter_surface(cloud2, mask2)
-    idx_map1 = jnp.squeeze(jnp.argwhere(mask1>=0.2))
-    idx_map2 = jnp.squeeze(jnp.argwhere(mask2>=0.2))
-    bidx_map1 = jnp.squeeze(jnp.argwhere(mask1<0.2))
-    bidx_map2 = jnp.squeeze(jnp.argwhere(mask2<0.2))
-    smasks_pair = [idx_map1, idx_map2]
-    bmasks_pair = [bidx_map1, bidx_map2]
-    print ('Split', time.time()-s)
-
-    s = time.time()
-    surf_cmap1 = cmap_from_cloud(surf_cloud1[:,None,:], surf_cloud1[None,:,:])
-    surf_cmap2 = cmap_from_cloud(surf_cloud2[:,None,:], surf_cloud2[None,:,:])
+    cmap1 = distances_from_cloud(cloud1[:,None,:], cloud1[None,:,:])
+    cmap2 = distances_from_cloud(cloud2[:,None,:], cloud2[None,:,:])
+    icmap = distances_from_cloud(cloud1[:,None,:], cloud2[None,:,:])
     print ('Cmaps', time.time()-s)
 
     s = time.time()
-    edges1, senders1, receivers1 = surface_edges(surf_cmap1, idx_map1)
-    edges2, senders2, receivers2 = surface_edges(surf_cmap2, idx_map2)
-    print ('Edges', time.time()-s)
+    edges1, senders1, receivers1 = get_edges(cmap1, enum)
+    edges2, senders2, receivers2 = get_edges(cmap2, enum)
+    senders2, receivers2 = senders2+pad, receivers2+pad
+
+    padlen1 = (pad-len(cloud1))*enum
+    padlen2 = (pad-len(cloud2))*enum
+    
+    edges1 = jnp.pad(edges1, (0, padlen1))
+    edges2 = jnp.pad(edges2, (0, padlen2))
+    senders1 = jnp.pad(senders1, (0, padlen1), constant_values=len(cloud1))
+    senders2 = jnp.pad(senders2, (0, padlen2), constant_values=len(cloud2)+pad)
+    receivers1 = jnp.pad(receivers1, (0, padlen1), constant_values=len(cloud1))
+    receivers2 = jnp.pad(receivers2, (0, padlen2), constant_values=len(cloud2)+pad)
+
+    edges12, senders12, receivers12,\
+    edges21, senders21, receivers21 = get_interface_edges(icmap, enum, pad) 
 
     #print (cloud1)
+    #print (cloud2)
     #print (mask1)
-    #print (idx_map1)
-    #print (surf_cmap1)
-    #print (edges1, edges1.shape)
-    #print (senders1, senders1.shape)
-    #print (receivers1, receivers1.shape)
+    #print (edges1.shape)
+    #print (senders1.shape)
+    #print (receivers1.shape)
+    #print (icmap)
+    #print (edges12)
+    #print (senders12)
+    #print (receivers12)
+    #print (edges21)
+    #print (senders21)
+    #print (receivers21)
+    #sys.exit()
 
-    s = time.time()
     edges1 = encode_distances(edges1)
     edges2 = encode_distances(edges2)
+    edges12 = encode_distances(edges12)
+    edges21 = encode_distances(edges21)
     print ('Distances', time.time()-s)
-
-    s = time.time()
-    graph_pair = [
-            GraphsTuple(nodes=nodes_pair[0], edges=edges1,
-                        senders=jnp.indices((10,)), receivers=receivers1,
-                        n_node=jnp.array([nodes_pair[0].shape[0]]),
-                        n_edge=jnp.array([edges1.shape[0]]),
-                        globals=jnp.array([1,0])),
-            GraphsTuple(nodes=nodes_pair[1], edges=edges2,
-                        senders=senders2, receivers=receivers2,
-                        n_node=jnp.array([nodes_pair[1].shape[0]]),
-                        n_edge=jnp.array([edges2.shape[0]]),
-                        globals=jnp.array([0,1]))]
-    print ('Graph', time.time()-s)
-
-    s = time.time()
-    # compute interface true cmap
-    icmap = cmap_from_cloud(cloud1[:,None,:], cloud2[None,:,:])
-    print ('Interface labels', time.time()-s)
-
-    # save original clouds
-    cloud_pair_real = [cloud1, cloud2]
-
-    s = time.time()
+    
     # randomly rotate and center input clouds CoM to the origin
+    s = time.time()
+    key1, key2 = jax.random.split(key)
     cloud_pair = [
-        initialize_clouds(cloud1, 42)[0], 
-        initialize_clouds(cloud2, 42)[0]]
+        initialize_clouds(cloud1, key1), 
+        initialize_clouds(cloud2, key2)]
+
+    mask1, mask2 = masks_pair
+    initial_transforms = [cloud_pair[0][1], cloud_pair[1][1]]
+    
+    mask1 = jnp.squeeze(jnp.where(mask1!=0, 1, 0))
+    mask2 = jnp.squeeze(jnp.where(mask2!=0, 1, 0))
+    cloud_pair = [cloud_pair[0][0]*mask1[:,None],
+                  cloud_pair[1][0]*mask2[:,None]]
     print ('Init clouds', time.time()-s)
 
+
     print (f'Finished {code}')
-    return [code, {'clouds':cloud_pair, 'orig_clouds':cloud_pair_real,
-                   'smasks':smasks_pair, 'bmasks':bmasks_pair,
-                   'graphs':graph_pair, 'interface':icmap}]
+    return [code, {'nodes':nodes_pair,
+                   'edges':[edges1, edges2],
+                   'iedges':[edges12, edges21],
+                   'senders':[senders1, senders2],
+                   'isenders':[senders12, senders21],
+                   'receivers':[receivers1, receivers2],
+                   'ireceivers':[receivers12, receivers21],
+                   'clouds':cloud_pair, 'masks':masks_pair,
+                   'init_rt':initial_transforms}]
     
 
 def plot_dataset_stats(dataset, subset_paths):
@@ -211,6 +213,8 @@ def main():
     neg_path_list = [line.rstrip() for line in glob.glob(neg_path)]
     path_list = pos_path_list+neg_path_list
 
+    key = jax.random.PRNGKey(46)
+
     for path in path_list:
         path2 = path[:-7]+'l'+path[-6:]
         code = path.split('/')[-1].strip('_r_b.pdb').upper()
@@ -218,7 +222,8 @@ def main():
         rec = pdbp.get_structure('', path)
         lig = pdbp.get_structure('', path2)
         print ('formatting')
-        formatted_data = format_data(code, rec, lig)
+        key, key1 = jax.random.split(key)
+        formatted_data = format_data(code, rec, lig, key1)
 
         if not formatted_data[1]: continue
         if path in neg_path_list:

@@ -26,9 +26,26 @@ class Critic(hk.Module):
         self.out_block = MultiLayerPerceptron(num_channels, num_channels, 1)
         self.value = Linear(1)
 
-    def __call__(self, g_rec, g_lig, g_int, action):
+    def __call__(self, 
+            n_rec, e_rec, s_rec, r_rec,
+            n_lig, e_lig, s_lig, r_lig,
+            e_int, s_int, r_int, action):
 
         action = self.action_encoding(action)
+
+        g_rec = jraph.GraphsTuple(
+                nodes=n_rec, edges=e_rec,
+                senders=s_rec, receivers=r_rec,
+                n_node=jnp.array([n_rec.shape[0]]),
+                n_edge=jnp.array([e_rec.shape[0]]),
+                globals=jnp.array([1,0])
+
+        g_lig = jraph.GraphsTuple(
+                nodes=n_lig, edges=e_lig,
+                senders=s_lig, receivers=r_lig,
+                n_node=jnp.array([n_lig.shape[0]]),
+                n_edge=jnp.array([e_lig.shape[0]]),
+                globals=jnp.array([0,1])
 
         # receptor/ligand encoding
         g_rec = self.encoding(g_rec)
@@ -42,9 +59,12 @@ class Critic(hk.Module):
             g_lig = module(g_lig)
 
         # elaborate interface level info
-        g_int = g_int._replace(
+        g_int = jraph.GraphsTuple(
                 nodes=jnp.concatenate((g_rec.nodes, g_lig.nodes), axis=0),
-                edges=self.encoding.e_enc(g_int.edges),
+                edges=self.encoding.e_enc(e_int),
+                senders=s_int, receivers=r_int,
+                n_node=jnp.array([g_rec.n_node+g_lig.n_node]),
+                n_edge=jnp.array([e_int.shape[0]]),
                 globals=action)
 
         for module in self.interaction_stack: g_int = module(g_int)

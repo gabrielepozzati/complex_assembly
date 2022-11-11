@@ -10,21 +10,21 @@ class Actor(hk.Module):
         self.encoding = GraphEncoding(num_channels)
 
         # surface encoding
-        self.single_stack = [AttentionGraphStack(num_heads, num_channels, edge_a=False) \
-                for n in range(4)] 
+        self.single_stack = [AttentionGraphStack(num_heads, num_channels, edge_a=False, node_a=False) \
+                for n in range(1)] 
 
-        self.interaction_stack = [AttentionGraphStack(num_heads, num_channels) \
-                for n in range(4)]
+        self.interaction_stack = [AttentionGraphStack(num_heads, num_channels, edge_a=False, node_a=False) \
+                for n in range(1)]
 
-        # pair encoding
-        self.pair_stack = [
-                [AttentionGraphStack(num_heads, num_channels, edge_a=False),
-                 AttentionGraphStack(num_heads, num_channels, edge_a=False)] \
-                for n in range(8)]
+#        # pair encoding
+#        self.pair_stack = [
+#                [AttentionGraphStack(num_heads, num_channels, edge_a=False, node_a=False),
+#                 AttentionGraphStack(num_heads, num_channels, edge_a=False, node_a=False)] \
+#                for n in range(1)]
 
         # transformation graph updates
-        self.docking_stack = [AttentionGraphStack(num_heads, num_channels, edge_a=False) \
-                for n in range(8)] 
+        self.docking_stack = [AttentionGraphStack(num_heads, num_channels, edge_a=False, node_a=False) \
+                for n in range(1)] 
 
         # roto-traslation output
         self.out_rblock = MultiLayerPerceptron(num_channels, num_channels, 1)
@@ -36,7 +36,25 @@ class Actor(hk.Module):
         self.out_cblock = MultiLayerPerceptron(num_channels, num_channels, 1)
         self.confidence = Linear(1)
 
-    def __call__(self, g_rec, g_lig, g_int):
+    def __call__(self, 
+            n_rec, e_rec, s_rec, r_rec,
+            n_lig, e_lig, s_lig, r_lig,
+            e_int, s_int, r_int):
+
+        g_rec = jraph.GraphsTuple(
+                nodes=n_rec, edges=e_rec,
+                senders=s_rec, receivers=r_rec,
+                n_node=jnp.array([n_rec.shape[0]]),
+                n_edge=jnp.array([e_rec.shape[0]]),
+                globals=jnp.array([1,0])
+
+        g_lig = jraph.GraphsTuple(
+                nodes=n_lig, edges=e_lig,
+                senders=s_lig, receivers=r_lig,
+                n_node=jnp.array([n_lig.shape[0]]),
+                n_edge=jnp.array([e_lig.shape[0]]),
+                globals=jnp.array([0,1])
+
         # receptor/ligand encoding
         g_rec = self.encoding(g_rec)
         g_lig = self.encoding(g_lig)
@@ -47,15 +65,20 @@ class Actor(hk.Module):
             g_lig = module(g_lig)
 
         # elaborate interface level info
-        g_int = g_int._replace(
+        g_int = jraph.GraphsTuple(
                 nodes=jnp.concatenate((g_rec.nodes, g_lig.nodes), axis=0),
-                edges=self.encoding.e_enc(g_int.edges))
+                edges=self.encoding.e_enc(e_int),
+                senders=s_int, receivers=r_int,
+                n_node=jnp.array([g_rec.n_node+g_lig.n_node]),
+                n_edge=jnp.array([e_int.shape[0]]),
+                globals=jnp.array([1,1]))
+
         for module in self.interaction_stack: g_int = module(g_int)
 
-        # elaborate mutual surface info
-        for module1, module2 in self.pair_stack:
-            g_rec = module1(g_rec, g_lig)
-            g_lig = module2(g_lig, g_rec)
+#        # elaborate mutual surface info
+#        for module1, module2 in self.pair_stack:
+#            g_rec = module1(g_rec, g_lig)
+#            g_lig = module2(g_lig, g_rec)
 
         # union of rec, lig and int edges and skip connection of int nodes  
         all_nodes = jnp.concatenate((g_rec.nodes, g_lig.nodes), axis=0)

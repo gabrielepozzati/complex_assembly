@@ -1,7 +1,9 @@
 import os
 import sys
+import jax
 import jax.numpy as jnp
 from typing import Dict, Union, Optional
+from ops import *
 
 from Bio.PDB.Structure import Structure
 from Bio.PDB.Model import Model
@@ -9,15 +11,17 @@ from Bio.PDB.mmcifio import MMCIFIO
 from Bio.PDB.PDBParser import PDBParser
 from Bio.PDB.MMCIFParser import MMCIFParser
 from Bio.PDB.Selection import unfold_entities
-from scipy.spatial.transform import Rotation as R
 
-def initialize_clouds(cloud: list, seed: int) -> Dict[str, jnp.ndarray]:
 
-    rotation = R.random(random_state=seed).as_matrix()
-    cloud = jnp.matmul(rotation, cloud.transpose()).transpose()
+def initialize_clouds(cloud, key):
+
+    cloud = jnp.array(cloud)
     cm = jnp.sum(cloud, axis=0)/cloud.shape[0]
     cloud = cloud - cm
-    tgroup = [rotation, cm]
+
+    quat = quat_from_pred(jax.random.normal(key, (3,)))
+    cloud = quat_rotation(cloud, quat)
+    tgroup = [cm, quat]
 
     return cloud, tgroup
 

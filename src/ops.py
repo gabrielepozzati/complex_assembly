@@ -55,14 +55,14 @@ def matrix_from_quat(q):
          [2*b*d-2*a*c, 2*c*d+2*a*b, aa-bb-cc+dd]])
 
 #@jax.jit
-def cmap_from_cloud(matrix1, matrix2):
+def distances_from_cloud(matrix1, matrix2):
     return jnp.sqrt(jnp.sum((matrix1-matrix2)**2, axis=-1))
 
 #@jax.jit
 def encode_distances(distances):
-    transform_far = 1-(32/jnp.clip(distances, a_min=32))
-    transform_close = 1-(jnp.clip(distances, a_min=0, a_max=32)/32)
-    return jnp.concatenate((transform_close, transform_far), axis=-1)
+    transform_far = 1-(3/jnp.clip(distances, a_min=3))
+    transform_close = 1-(jnp.clip(distances, a_max=12)/12)
+    return jnp.stack((transform_close, transform_far), axis=-1)
 
 #@jax.jit
 #def one_hot_distances(distances, bin_size=1):

@@ -141,7 +141,6 @@ class MultiLayerPerceptron(hk.Module):
     for layer in self.stack:
       x = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
       x = jax.nn.relu(layer(x))
-      
     x = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
     return jax.nn.relu(self.out_layer(x))
 
@@ -614,15 +613,12 @@ class InvariantPointAttention(hk.Module):
 class GraphEncoding(hk.Module):
     def __init__(self, num_channels, name='GE'):
         super().__init__(name=name)
-        self.n_enc1 = Linear(2**7, num_input_dims=2)
-        self.n_enc2 = MultiLayerPerceptron(num_channels, num_channels, 1)
-        self.e_enc = MultiLayerPerceptron(2**5, num_channels, 2)
+        self.n_enc = MultiLayerPerceptron(2**7, num_channels, 1)
+        self.e_enc = MultiLayerPerceptron(2**5, num_channels, 1)
 
     def __call__(self, g):
-        n_rec = self.n_enc1(g.nodes)
-        n_rec = self.n_enc2(n_rec)
+        n_rec = self.n_enc(g.nodes)
         e_rec = self.e_enc(g.edges)
-        
         return g._replace(nodes=n_rec, edges=e_rec)
 
 

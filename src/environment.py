@@ -3,6 +3,7 @@ import jax
 import time
 import jraph
 import pickle
+from jax import vmap
 import jax.numpy as jnp
 from functools import partial
 from jax import jit
@@ -10,188 +11,88 @@ from jax import jit
 from ops import *
 from graph import *
 
-class GWrapper():
-    def __init__(self, g):
-        self.g = g
-
 class DockingEnv():
-    def __init__(self, dataset, PNRG):
+    def __init__(self, dataset, enum, pad, PNRG):
         self.key = PNRG
         self.list = list(dataset.keys())
+        self.size = dataset[self.list[0]][0].shape[0]
+        self.number = len(self.list)
+        self.init_rt = {pdb:dataset[pdb]['init_rt'] for pdb in self.list}
+        self.enum = enum
+        self.pad = pad
 
-        self.visit_lookup = {
-                pdb:jnp.zeros((dataset[pdb]['clouds'][0].shape[0],
-                               dataset[pdb]['clouds'][1].shape[0])) \
-                for pdb in dataset}
+        def _stack_dataset(idx):
+            masks = jnp.stack([dataset[pdb]['masks'][idx] for pdb in self.list])
+            clouds = jnp.stack([dataset[pdb]['clouds'][idx] for pdb in self.list])     
+            nodes = jnp.stack([dataset[pdb]['nodes'][idx] for pdb in self.list])
+            edges = jnp.stack([dataset[pdb]['edges'][idx] for pdb in self.list])
+            iedges = jnp.stack([dataset[pdb]['iedges'][idx] for pdb in self.list])
+            senders = jnp.stack([dataset[pdb]['senders'][idx] for pdb in self.list])
+            isenders = jnp.stack([dataset[pdb]['isenders'][idx] for pdb in self.list])
+            receivers = jnp.stack([dataset[pdb]['receivers'][idx] for pdb in self.list])
+            ireceivers = jnp.stack([dataset[pdb]['ireceivers'][idx] for pdb in self.list])
+            return masks, clouds, nodes, edges, senders, receivers, 
+                   iedges, isenders, ireceivers
 
+        self.masks_rec, self.clouds_rec, self.nodes_rec,\
+        self.edges_rec, self.senders_rec, self.receivers_rec,\
+        self.iedges_rec, self.isenders_rec, self.ireceivers_rec = _stack_dataset(0)
 
-        self.len_rec = {pdb:dataset[pdb]['clouds'][0].shape[0] for pdb in dataset}
-        self.len_lig = {pdb:dataset[pdb]['clouds'][1].shape[0] for pdb in dataset}
+        self.masks_lig, self.clouds_lig, self.nodes_lig,\
+        self.edges_lig, self.senders_lig, self.receivers_lig,\
+        self.iedges_lig, self.isenders_lig, self.ireceivers_lig = _stack_dataset(1)
 
-        self.smask_rec = {pdb:dataset[pdb]['smasks'][0] for pdb in dataset}
-        self.smask_lig = {pdb:dataset[pdb]['smasks'][1] for pdb in dataset}
-        
-        self.bmask_rec = {pdb:dataset[pdb]['bmasks'][0] for pdb in dataset}
-        self.bmask_lig = {pdb:dataset[pdb]['bmasks'][1] for pdb in dataset}
-        
-        self.graph_rec = {pdb:dataset[pdb]['graphs'][0] for pdb in dataset}
-        self.graph_lig = {pdb:dataset[pdb]['graphs'][1] for pdb in dataset}
+        self.distances_from_cloud = vmap(distances_from_cloud)
+        self.dmaps = self.distances_from_cloud(self.clouds_rec[:,None,:],
+                                               self.clouds_lig[None,:,:])
 
-        self.cloud_rec = {pdb:dataset[pdb]['clouds'][0] for pdb in dataset}         
-        self.scloud_rec = self.mask_filter(self.cloud_rec, self.smask_rec)
-        self.bcloud_rec = self.mask_filter(self.cloud_rec, self.bmask_rec)
-
-        self.labels = {pdb:jnp.where(
-            (dataset[pdb]['interface']<8) & (dataset[pdb]['interface']>=3), 
-            1, 0) for pdb in dataset}
+        self.lengths_rec = jnp.sum(jnp.where(self.mask_rec!=0, 1, 0), axis=0)
+        self.lengths_lig = jnp.sum(jnp.where(self.mask_lig!=0, 1, 0), axis=0)
 
 
     def reset(self, dataset):
-        self.cloud_lig = {pdb:dataset[pdb]['clouds'][1] for pdb in dataset}
-        self.scloud_lig = self.mask_filter(self.cloud_lig, self.smask_lig)
-        self.bcloud_lig = self.mask_filter(self.cloud_lig, self.bmask_lig)
-        
-        self.contacts = jax.tree_util.tree_map(
-                lambda x, y: cmap_from_cloud(x[:,None,:], y[None,:,:]),
-                self.cloud_rec, self.cloud_lig)
-
-    def mask_filter(self, cloud, mask):
-        return jax.tree_util.tree_map(lambda x, y: x[y], cloud, mask)
+        self.clouds_lig = jnp.stack([dataset[pdb]['clouds'][idx] for pdb in dataset])
+        self.cmaps = self.distances_from_cloud(self.clouds_rec[:,None,:],
+                                               self.clouds_lig[None,:,:])
 
     @partial(jit, static_argnums=(0,))
-    def step(self, actions):
+    def step(self, clouds, actions):
 
-        def _step(actions, clouds):
-            
-            def _one_cloud_step(cloud, action):
-                rot_cloud = quat_rotation(cloud, action[:4])
-                tr_cloud = rot_cloud+action[None,4:-1]
-                return tr_cloud
-            
-            geom_centers = jax.tree_util.tree_map(
-                    lambda x: jnp.sum(x, axis=0)/x.shape[0], 
-                    clouds)
-
-            ligand_frames = jax.tree_util.tree_map(lambda x, y: x-y[None,:],
-                    clouds, geom_centers)
-            
-
-            transformed = jax.tree_util.tree_map(_one_cloud_step, 
-                    ligand_frames, actions)
-
-            return jax.tree_util.tree_map(lambda x, y: x+y[None,:],
-                    transformed, geom_centers)
-
+        def _single_step(cloud, action, length):
+            geom_center = jnp.sum(cloud)/length
+            ligand_frames = cloud - geom_center[None,:]
+            transformed_cloud = quat_rotation(ligand_frames, action[:4])
+            transformed_cloud = transformed_cloud+action[4:-1]
+            return transformed_cloud + geom_centers[None,:]
         
-        def _get_reward(new_cmap, new_cont, real, diff, lookup, action):
-            confidence = action[-1]
-            
-            clashes = jnp.sum(jnp.where(new_cmap<3, 1, 0))
+        def _get_reward(new_dmap):
+            clashes = jnp.where(new_dmap<6 & new_dmap!=0, (6-new_dmap)/6, 0)
+            clashes = jnp.sum(clashes)
+            new_dmap = jnp.where(new_dmap==0, 1e9, new_dmap)
+            return -(clashes+jnp.min(new_dmap))
 
-            diff = jnp.sum(diff*jnp.clip(
-                        1/2**(8+lookup), a_min=0.00001, a_max=0.001))
-
-            match = jnp.sum(jnp.where((new_cont==1) & (real==1), 1, 0))
-            mismatch = jnp.sum(jnp.where((new_cont==1) & (real==0), 1, 0))
-            
-            final_reward = (match-(mismatch+clashes))*confidence
-            inner_reward = diff-(clashes*(1-confidence))-jnp.min(new_cmap)
-            return inner_reward+final_reward
-
-        new_ligs = _step(actions, self.cloud_lig)
-        new_cmaps = jax.tree_util.tree_map(
-                lambda x, y: cmap_from_cloud(x[:,None,:], y[None,:,:]), self.cloud_rec, new_ligs)
+        new_clouds_lig = vmap(_single_step)(clouds, actions, self.lengths_lig)
         
-        old_cont = jax.tree_util.tree_map(
-                lambda x: jnp.where((x<8) & (x>=3), 1, 0), self.contacts)
-        new_cont = jax.tree_util.tree_map(
-                lambda x: jnp.where((x<8) & (x>=3), 1, 0), new_cmaps)
-        diff_contacts = jax.tree_util.tree_map(
-                lambda x, y: jnp.where((x==1) & (y==0), 1, 0), new_cont, old_cont)
-        updated_lookup = jax.tree_util.tree_map(
-                lambda x, y: x+y, self.visit_lookup, diff_contacts)
+        new_dmaps = self.distances_from_cloud(self.clouds_rec[:,None,:], 
+                                              new_clouds_lig[None,:,:])
 
-        reward = jax.tree_util.tree_map(
-                _get_reward, new_cmaps, new_cont, self.labels, 
-                diff_contacts, self.visit_lookup, actions)
+        rewards = vmap(_get_reward)(new_dmaps)
         
-        return reward, new_ligs, new_cmaps, updated_lookup
+        return rewards, new_clouds_lig, new_dmaps
 
     @partial(jit, static_argnums=(0,))
-    def get_state(self):
+    def get_states(self, dmap):
 
-        def _concat_across_dic(sr, sl, br, bl):
-            return jax.tree_util.tree_map(
-                lambda a,b,c,d: jnp.concatenate((a,b,c,d), axis=0), sr, sl, br, bl)
+        def _get_state(dmap, enum, pad):
+            edges12, senders12, receivers12,\
+            edges21, senders21, receivers21 = get_interface_edges(dmap, enum, pad) 
+            all_edges = jnp.concatenate((edges12, edges21), axis=0)
+            all_senders = jnp.concatenate((senders12, senders21), axis=0)
+            all_receivers = jnp.concatenate((receivers12, receivers21), axis=0)
+            return all_edges, all_senders, all_receivers
 
-        def _interface_graph(edges, senders, receivers):
-            n_edges = jnp.array(senders.shape[0])
-            return GWrapper(jraph.GraphsTuple(
-                        nodes=jnp.array([]), edges=edges,
-                        senders=senders, receivers=receivers,
-                        n_node=jnp.array([0]), n_edge=n_edges,
-                        globals=[1,1]))
-
-        #s-urface cmaps and b-uried cmaps
-        scmaps = jax.tree_util.tree_map(
-                lambda x, y: cmap_from_cloud(x[:,None,:], y[None,:,:]), 
-                self.scloud_rec, self.scloud_lig)
-        bcmaps = jax.tree_util.tree_map(
-                lambda x, y: cmap_from_cloud(x[:,None,:], y[None,:,:]),
-                self.bcloud_rec, self.bcloud_lig)
-        
-        # compute surface edges
-        surface_links_r = jax.tree_util.tree_map(surface_edges, scmaps, self.smask_rec)
-        surface_links_l = jax.tree_util.tree_map(
-                lambda x, y: surface_edges(x.transpose(), y), scmaps, self.smask_lig)
-        
-        # unpack surface edges and indexes
-        sedges_r = jax.tree_util.tree_map(lambda x: x[0], surface_links_r)
-        ssenders_r = jax.tree_util.tree_map(lambda x: x[1], surface_links_r)
-        sreceivers_r = jax.tree_util.tree_map(lambda x: x[2], surface_links_r)
-        sedges_l = jax.tree_util.tree_map(lambda x: x[0], surface_links_l)
-        ssenders_l = jax.tree_util.tree_map(lambda x: x[1], surface_links_l)
-        sreceivers_l = jax.tree_util.tree_map(lambda x: x[2], surface_links_l)
-
-        #compute buried edges
-        breceivers_r = jax.tree_util.tree_map(lambda x: jnp.argmin(x, axis=1), bcmaps)
-        breceivers_l = jax.tree_util.tree_map(lambda x: jnp.argmin(x, axis=0), bcmaps)
-        bsenders_r = jax.tree_util.tree_map(lambda x: jnp.indices(x.shape)[0], breceivers_r)
-        bsenders_l = jax.tree_util.tree_map(lambda x: jnp.indices(x.shape)[0], breceivers_l)
-        bedges_r = jax.tree_util.tree_map(lambda x, y, z: x[y,z], bcmaps, bsenders_r, breceivers_r)
-        bedges_l = jax.tree_util.tree_map(lambda x, y, z: x[y,z], bcmaps, bsenders_l, breceivers_l)
-
-        # shift to full cmap indexes
-        bsenders_r = jax.tree_util.tree_map(lambda x, y: x[y], self.bmask_rec, bsenders_r)
-        bsenders_l = jax.tree_util.tree_map(lambda x, y: x[y], self.bmask_lig, bsenders_l)
-        breceivers_r = jax.tree_util.tree_map(lambda x, y: x[y], self.bmask_lig, breceivers_r)
-        breceivers_l = jax.tree_util.tree_map(lambda x, y: x[y], self.bmask_rec, breceivers_l)
-
-        # apply shift to receptor indexes to match pre-existing graph indexes
-        rec_shift = self.len_rec+self.len_lig
-        ssenders_r -= rec_shift
-        bsenders_r -= rec_shift
-        sreceivers_l -= rec_shift
-        breceivers_l -= rec_shift
-        
-        # apply shift to ligand indexes to match pre-existing graph indexes
-        ssenders_l -= self.len_lig
-        bsenders_l -= self.len_lig
-        sreceivers_r -= self.len_lig
-        breceivers_r -= self.len_lig
-
-        # encode edges features
-        sedges_r = jax.tree_util.tree_map(encode_distances, sedges_r)
-        sedges_l = jax.tree_util.tree_map(encode_distances, sedges_l)
-        bedges_r = jax.tree_util.tree_map(encode_distances, bedges_r)
-        bedges_l = jax.tree_util.tree_map(encode_distances, bedges_l)
-
-        # concatenate edges
-        all_edges = _concat_across_dic(sedges_r, sedges_l, bedges_r, bedges_l)
-        all_senders = _concat_across_dic(ssenders_r, ssenders_l, bsenders_r, bsenders_l)
-        all_receivers = _concat_across_dic(sreceivers_r, sreceivers_l, breceivers_r, breceivers_l)
-        
-        return jax.tree_util.tree_map(_interface_graph, all_edges, all_senders, all_receivers)
+        return vmap(_get_state)(dmap, self.enum, self.pad, in_axes=(0,None,None))
+         
 
 def main():
     data_path = '/home/pozzati/complex_assembly/data/train_features.pkl'

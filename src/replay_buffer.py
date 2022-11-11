@@ -1,45 +1,37 @@
 import jax
 import jax.numpy as jnp
+import jax.random as jrn
 
-class ReplayBuffer():
-    def __init__(self, env, max_size, key, device='cpu'):
-        self.env = env
+class ReplayBuffer(key, max_size, pnum, enum, pad):
+    def __init__(self):
         self.key = key
         self.actual_size = 0
         self.max_size = max_size
-        self.data = {pdb:Experience_List(max_size) for pdb in self.env.list}        
-        #jax.device_put(self.data, jax.devices(device)[0])
-
-    def add(self, experiences):
-        self.data = jax.tree_util.tree_map(lambda x, y: x.add(y), 
-                self.data, experiences)
-
-    def sample(self, batch_size):
-        return jax.tree_util.tree_map(
-                lambda x: jnp.random.choice(x.list, size=batch_size, replace=False),
-                self.data)
-
-
-class Experience:
-    def __init__(self, 
-            prev_state, next_state,
-            action, reward):
         
-        self.prev_state = prev_state
-        self.next_state = next_state
-        self.action = action
-        self.reward = reward
+        shape_idx = (1, pnum, pad*enum)
+        shape_edges = (1, pnum, pad*enum, 2)
+        self.data = {
+                'prev_edges':jnp.empty(shape_edges, dtype=jnp.float32),
+                'prev_senders':jnp.empty(shape_idx, dtype=jnp.uint16),
+                'prev_receivers':jnp.empty(shape_idx, dtype=jnp.uint16),
+                'next_edges':jnp.empty(shape_edges, dtype=jnp.float32),
+                'next_senders':jnp.empty(shape_idx, dtype=jnp.uint16),
+                'next_receivers':jnp.empty(shape_idx, dtype=jnp.uint16),
+                'actions':jnp.empty((1, pnum, 8), dtype=jnp.float32),
+                'rewards':jnp.empty((1, pnum), dtype=jnp.float32)}
 
-class Experience_List:
-    def __init__(self, max_size):
-        self.list = ()
-        self.actual_size = 0
-        self.max_size = max_size
+    def add_to_replay(self, experience):
+        if actual_size == self.max_size:
+            for key in data: data[key] = data[key][1:]
+        else: actual_size += 1
 
-    def add(self, experience):
-        if self.actual_size == self.max_size:
-            self.list[1:] += (experience,)
-        else:
-            self.list += (experience,)
-            self.actual_size += 1
+        for idx, (key, array) in enumerate(self.data.items()):
+            self.data[key] = jnp.concatenate((array, experience[idx]), axis=0)
+
+    def sample_from_replay(self, batch_size):
+        self.key, key = jrn.split(self.key)
+        idxs = jrn.choice(key, self.actual_size, shape=(batch_size,), replace=False)
+
+        return {key:data[key][idxs] for key in data}
+
 
