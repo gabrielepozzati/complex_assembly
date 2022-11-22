@@ -40,15 +40,19 @@ H_MASK = jnp.stack(
      H2_MASK, H3_MASK))
 
 def quat_from_pred(array):
-    norm_factor = jnp.sqrt(1+jnp.sum(array**2))
-    array = array/norm_factor
-    first = jnp.array([1/norm_factor])
-    return jnp.concatenate((first, array))
+    ndims = len(array.shape)
+    if ndims == 1: array = jnp.expand_dims(array, axis=0)
+
+    norm_factor = jnp.sqrt(1+jnp.sum(array**2, axis=-1))
+    norm_factor = jnp.expand_dims(norm_factor, axis=1)
+
+    ones_shape = (array.shape[0], 1)
+    array = jnp.concatenate((jnp.ones(ones_shape), array), axis=-1)
+    return array/norm_factor
 
 def matrix_from_quat(q):
     a, b, c, d = q
     aa, bb, cc, dd = a**2, b**2, c**2, d**2
-
     return jnp.array(
         [[aa+bb-cc-dd, 2*b*c-2*a*d, 2*b*d+2*a*c],
          [2*b*c+2*a*d, aa-bb+cc-dd, 2*c*d-2*a*b],

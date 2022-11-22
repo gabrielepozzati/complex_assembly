@@ -13,17 +13,29 @@ from Bio.PDB.MMCIFParser import MMCIFParser
 from Bio.PDB.Selection import unfold_entities
 
 
-def initialize_clouds(cloud, key):
+def initialize_clouds(cloud1, cloud2, cmap1, cmap2, key):
+    
+    def cloud_center(cloud):
+        return jnp.sum(cloud, axis=0)/cloud.shape[0]
 
-    cloud = jnp.array(cloud)
-    cm = jnp.sum(cloud, axis=0)/cloud.shape[0]
-    cloud = cloud - cm
+    def init_cloud(cloud, cm, key):
+        cloud = cloud-cm[None,:]
+        quat = quat_from_pred(jax.random.normal(key, (3,)))
+        cloud = quat_rotation(cloud, quat)
+        tgroup = [cm, quat]
+        return cloud, tgroup
 
-    quat = quat_from_pred(jax.random.normal(key, (3,)))
-    cloud = quat_rotation(cloud, quat)
-    tgroup = [cm, quat]
+    cm1 = cloud_center(cloud1)
+    cm2 = cloud_center(cloud2)
 
-    return cloud, tgroup
+    max_c1 = jnp.max(cmap1)
+    max_c2 = jnp.max(cmap2)
+    cm2 -= jnp.array([max_c1+max_c2, 0., 0.])
+
+    key1, key2 = jax.random.split(key, 2)
+    cloud1, tgroup1 = init_cloud(cloud1, cm1, key1)
+    cloud2, tgroup2 = init_cloud(cloud2, cm2, key2)
+    return cloud1, cloud2, tgroup1, tgroup2
 
 def write_mmcif(chain_ids, transforms, in_path, out_path) -> None:
     io = MMCIFIO()

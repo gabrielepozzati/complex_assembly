@@ -12,25 +12,27 @@ class Critic(hk.Module):
         self.action_encoding = MultiLayerPerceptron(num_channels, num_channels, 2)
 
         # surface encoding 
-        self.single_stack = [AttentionGraphStack(num_heads, num_channels, edge_a=False) \
-                for n in range(4)]
+        self.single_stack = [AttentionGraphStack(num_heads, num_channels, node_a=False, edge_a=False) \
+                for n in range(1)]
 
-        self.interaction_stack = [AttentionGraphStack(num_heads, num_channels) \
-                for n in range(4)]
+        self.interaction_stack = [AttentionGraphStack(num_heads, num_channels, node_a=False, edge_a=False) \
+                for n in range(1)]
 
         # transformation graph updates
-        self.docking_stack = [AttentionGraphStack(num_heads, num_channels, edge_a=False) \
-                for n in range(8)]
+        self.docking_stack = [AttentionGraphStack(num_heads, num_channels, node_a=False, edge_a=False) \
+                for n in range(1)]
 
         # confidence output
         self.out_block = MultiLayerPerceptron(num_channels, num_channels, 1)
         self.value = Linear(1)
 
     def __call__(self, 
-            n_rec, e_rec, s_rec, r_rec,
-            n_lig, e_lig, s_lig, r_lig,
+            e_rec, s_rec, r_rec, n_rec,
+            e_lig, s_lig, r_lig, n_lig,
             e_int, s_int, r_int, action):
-
+ 
+        identity = jnp.array((1.,0.,0.,0.,0.,0.,0.,0.))
+        identity = self.action_encoding(identity)
         action = self.action_encoding(action)
 
         g_rec = jraph.GraphsTuple(
@@ -38,20 +40,20 @@ class Critic(hk.Module):
                 senders=s_rec, receivers=r_rec,
                 n_node=jnp.array([n_rec.shape[0]]),
                 n_edge=jnp.array([e_rec.shape[0]]),
-                globals=jnp.array([1,0])
+                globals=identity)
 
         g_lig = jraph.GraphsTuple(
                 nodes=n_lig, edges=e_lig,
                 senders=s_lig, receivers=r_lig,
                 n_node=jnp.array([n_lig.shape[0]]),
                 n_edge=jnp.array([e_lig.shape[0]]),
-                globals=jnp.array([0,1])
+                globals=action)
 
         # receptor/ligand encoding
         g_rec = self.encoding(g_rec)
         g_lig = self.encoding(g_lig)
-        g_rec._replace(globals=jnp.zeros(action.shape))
-        g_lig._replace(globals=action)
+        #g_rec._replace(globals=jnp.zeros(action.shape))
+        #g_lig._replace(globals=action)
 
         # elaborate surface level info
         for module in self.single_stack:
@@ -74,9 +76,9 @@ class Critic(hk.Module):
         all_edges = jnp.concatenate(
                 (g_rec.edges, g_lig.edges, g_int.edges), axis=0)
         all_senders = jnp.concatenate(
-                (g_rec.senders, g_lig.senders, g_int.senders), axis=0)
+                (g_rec.senders, g_lig.senders+400, g_int.senders), axis=0)
         all_receivers = jnp.concatenate(
-                (g_rec.receivers, g_lig.receivers, g_int.receivers), axis=0)
+                (g_rec.receivers, g_lig.receivers+400, g_int.receivers), axis=0)
         agg_globals = g_rec.globals+g_lig.globals+g_int.globals
 
         g_int = jraph.GraphsTuple(
@@ -91,7 +93,7 @@ class Critic(hk.Module):
         
         # elaborate q-value
         q = self.out_block(g_int.globals)
-        q = self.value(q)
+        q = (jax.nn.sigmoid(self.value(q))*100)-50
 
         return q
 

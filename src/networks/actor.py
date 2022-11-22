@@ -36,9 +36,9 @@ class Actor(hk.Module):
         self.out_cblock = MultiLayerPerceptron(num_channels, num_channels, 1)
         self.confidence = Linear(1)
 
-    def __call__(self, 
-            n_rec, e_rec, s_rec, r_rec,
-            n_lig, e_lig, s_lig, r_lig,
+    def __call__(self,
+            e_rec, s_rec, r_rec, n_rec, 
+            e_lig, s_lig, r_lig, n_lig,
             e_int, s_int, r_int):
 
         g_rec = jraph.GraphsTuple(
@@ -46,14 +46,14 @@ class Actor(hk.Module):
                 senders=s_rec, receivers=r_rec,
                 n_node=jnp.array([n_rec.shape[0]]),
                 n_edge=jnp.array([e_rec.shape[0]]),
-                globals=jnp.array([1,0])
+                globals=jnp.array((1,0)))
 
         g_lig = jraph.GraphsTuple(
                 nodes=n_lig, edges=e_lig,
                 senders=s_lig, receivers=r_lig,
                 n_node=jnp.array([n_lig.shape[0]]),
                 n_edge=jnp.array([e_lig.shape[0]]),
-                globals=jnp.array([0,1])
+                globals=jnp.array((0,1)))
 
         # receptor/ligand encoding
         g_rec = self.encoding(g_rec)
@@ -71,7 +71,7 @@ class Actor(hk.Module):
                 senders=s_int, receivers=r_int,
                 n_node=jnp.array([g_rec.n_node+g_lig.n_node]),
                 n_edge=jnp.array([e_int.shape[0]]),
-                globals=jnp.array([1,1]))
+                globals=jnp.array((1,1)))
 
         for module in self.interaction_stack: g_int = module(g_int)
 
@@ -85,9 +85,9 @@ class Actor(hk.Module):
         all_edges = jnp.concatenate(
                 (g_rec.edges, g_lig.edges, g_int.edges), axis=0)
         all_senders = jnp.concatenate(
-                (g_rec.senders, g_lig.senders, g_int.senders), axis=0)
+                (g_rec.senders, g_lig.senders+400, g_int.senders), axis=0)
         all_receivers = jnp.concatenate(
-                (g_rec.receivers, g_lig.receivers, g_int.receivers), axis=0)
+                (g_rec.receivers, g_lig.receivers+400, g_int.receivers), axis=0)
         agg_globals = g_rec.globals+g_lig.globals
 
         g_int = jraph.GraphsTuple(
@@ -103,12 +103,12 @@ class Actor(hk.Module):
         # elaborate final global feature to rot. and trasl.
         out_r = self.out_rblock(g_int.globals)
         out_t = self.out_tblock(g_int.globals+out_r)
-        out_t = self.traslator(out_t)
-        out_r = jnp.tanh(self.rotator(out_r))
+        out_t = (jax.nn.sigmoid(self.traslator(out_t))*2)-1
+        out_r = (jax.nn.sigmoid(self.rotator(out_r))*0.2)-0.1
 
         # elaborate confidence estimation
         out_c = self.out_cblock(g_int.globals)
         out_c = jax.nn.sigmoid(self.confidence(out_c))
 
-        return jnp.concatenate((out_r, out_t, out_c), axis=-1)
+        return jnp.squeeze(jnp.concatenate((out_r, out_t, out_c), axis=-1))
 
