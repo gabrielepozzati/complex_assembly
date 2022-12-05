@@ -103,8 +103,8 @@ class Actor(hk.Module):
         # elaborate final global feature to rot. and trasl.
         out_r = self.out_rblock(g_int.globals)
         out_t = self.out_tblock(g_int.globals+out_r)
-        out_t = (jax.nn.sigmoid(self.traslator(out_t))*2)-1
-        out_r = (jax.nn.sigmoid(self.rotator(out_r))*0.2)-0.1
+        out_t = (jax.nn.sigmoid(self.traslator(out_t))*20)-10
+        out_r = (jax.nn.sigmoid(self.rotator(out_r))*0.02)-0.01
 
         # elaborate confidence estimation
         out_c = self.out_cblock(g_int.globals)

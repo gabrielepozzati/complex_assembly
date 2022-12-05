@@ -33,7 +33,7 @@ def parse_args():
         help="data path")
     parser.add_argument("--seed", type=int, default=42,
         help="seed of the experiment")
-    parser.add_argument("--steps", type=int, default=1100,
+    parser.add_argument("--steps", type=int, default=20000,
         help="total number of steps")
     parser.add_argument("--episode_steps", type=int, default=100,
         help="total number of steps")
@@ -49,13 +49,13 @@ def parse_args():
         help="target smoothing coefficient (default: 0.005)")
     parser.add_argument("--batch_size", type=int, default=16,
         help="the batch size of sample from the reply memory")
-    parser.add_argument("--batch_pair_num", type=int, default=2,
+    parser.add_argument("--batch_pair_num", type=int, default=1,
         help="the batch size of sample from the reply memory")
     parser.add_argument("--rot_noise", type=float, default=0.001,
         help="the standard dev. of rotation noise")
-    parser.add_argument("--tr_noise", type=float, default=0.1,
+    parser.add_argument("--tr_noise", type=float, default=1,
         help="the standard dev. of traslation noise")
-    parser.add_argument("--policy_frequency", type=int, default=5,
+    parser.add_argument("--policy_frequency", type=int, default=100,
         help="the frequency of training policy (delayed)")
     parser.add_argument("--noise_clip", type=float, default=0.5,
         help="noise clip parameter of the Target Policy Smoothing Regularization")
@@ -63,6 +63,7 @@ def parse_args():
     return args
 
 def load_dataset(path, size=None, skip=0):
+    count = 0
     dataset = {}
     for idx, path in enumerate(glob.glob(path+'/*')):
         if idx < skip: continue
@@ -80,7 +81,8 @@ def load_dataset(path, size=None, skip=0):
             data[lbl] = jnp.array(data[lbl])
 
         dataset[code] = data
-        if idx+1 == size: break
+        count += 1
+        if count == size: break
 
     return dataset, code
 
@@ -138,8 +140,8 @@ def save_to_model(out_struc, ref_model, quat, tr, init=False):
 if __name__ == "__main__":
     s = time.time()
     args = parse_args()
-    dataset, code = load_dataset(args.path, size=5)
-    test, test_code = load_dataset(args.path, size=1, skip=5)
+    dataset, code = load_dataset(args.path, size=1)
+    test, test_code = load_dataset(args.path, size=1)
 
     io = PDBIO()
     pdbp = PDBParser(QUIET=True)
@@ -173,7 +175,10 @@ if __name__ == "__main__":
     # environment setup
     envs = DockingEnv(dataset, 4, 400, env_key)
     envs_test = DockingEnv(test, 4, 400, env_key)
-    print (envs.list)
+    print (envs_test.list)
+    print (envs_test.e_rec.shape, envs_test.s_rec.shape, envs_test.r_rec.shape, envs_test.n_rec.shape,
+           envs_test.e_lig.shape, envs_test.s_lig.shape, envs_test.r_lig.shape, envs_test.n_lig.shape,
+           envs_test.e_int.shape, envs_test.s_int.shape, envs_test.r_int.shape)
 
     # replay buffer setup
     r_buffer = ReplayBuffer(buff_key, args.buffer_size,
@@ -319,9 +324,7 @@ if __name__ == "__main__":
     print ('Filling buffer...')
     loss_series = []
     reward_series = []
-    rewards = jnp.zeros((envs.number,))
-    discount_indexes = jnp.zeros((envs.number,))
-
+    rewards_episode = []
     for global_step in range(args.steps):
         
         if global_step == args.buffer_size: 
@@ -341,6 +344,7 @@ if __name__ == "__main__":
                 envs.e_int, envs.s_int, envs.r_int)
 
         # add noise to action
+        noiseless = actions
         actions = vmap(lambda a, x, y, z: jnp.concatenate(
                 (jnp.squeeze(a[:3] + jrn.normal(x, shape=(3,))*args.rot_noise),
                  jnp.squeeze(a[3:-1] + jrn.normal(y, shape=(3,))*args.tr_noise),
@@ -356,9 +360,8 @@ if __name__ == "__main__":
                 [envs.n_lig[:,:,:-3], c_lig_next], axis=-1)
         
         # get reward for last action
-        rewards_next = envs.get_rewards(dmaps)
-        rewards += rewards_next*(args.gamma**discount_indexes)
-        discount_indexes = 0
+        rewards = envs.get_rewards(dmaps)
+        rewards_episode.append(rewards)
 
         # store experiences in replay buffer
         r_buffer.buffer, r_buffer.actual_size = r_buffer.add_to_replay(
@@ -367,7 +370,7 @@ if __name__ == "__main__":
              'prev_nodes':envs.n_lig, 'next_nodes':n_lig_next,
              'prev_senders':envs.s_int, 'next_senders':s_int_next,
              'prev_receivers':envs.r_int, 'next_receivers':r_int_next,
-             'actions':actions, 'rewards':rewards_next})
+             'actions':actions, 'rewards':rewards})
 
         # update state for next iteration
         envs.c_lig = c_lig_next
@@ -377,11 +380,14 @@ if __name__ == "__main__":
         envs.n_lig = n_lig_next
 
         # check reset conditions
-        chains_distances = jnp.min(jnp.where(dmaps==0, 1e9, dmaps), axis=0)
+        chains_distances = jnp.where(dmaps==0, 1e9, dmaps)
+        clashes = jnp.sum(jnp.where(chains_distances<4, 1, 0))
+
         if (global_step+1)%args.episode_steps == 0 \
-        or jnp.any(chains_distances>16):
+        or (global_step+1) == args.buffer_size \
+        or jnp.all(chains_distances>12) \
+        or clashes > 50:
             reset_idxs = jnp.ravel(jnp.indices((envs.number,)))
-            discount_indexes = jnp.zeros((envs.number,))
             envs.reset(dataset, reset_idxs)
             # if check hard limit for chain distances
             #chains_distances = jnp.min(jnp.where(dmaps==0, 1e9, dmaps), axis=0)
@@ -424,7 +430,8 @@ if __name__ == "__main__":
                         actor_state, critic_state, batch, prot_idxs)
 
             # store rewards
-            mean_reward = jnp.mean(rewards)
+            mean_reward = jnp.mean(jnp.array(rewards_episode))
+            rewards_episode = []
             loss_series.append(crit_loss)
             reward_series.append(mean_reward)
             print (f'Completed episode {global_step+1} - {time.time()-sg}')
@@ -445,17 +452,15 @@ if __name__ == "__main__":
     plt.savefig('reward.png')
 
     for global_step in range(args.test_steps):
-        print (envs_test.e_rec.shape, envs_test.s_rec.shape, envs_test.r_rec.shape, envs_test.n_rec.shape,
-               envs_test.e_lig.shape, envs_test.s_lig.shape, envs_test.r_lig.shape, envs_test.n_lig.shape,
-               envs_test.e_int.shape, envs_test.s_int.shape, envs_test.r_int.shape)
         # run actor
-        actions = vmap(partial(a_apply, a_params, None))(
-                envs_test.e_rec, envs_test.s_rec, envs_test.r_rec, envs_test.n_rec,
-                envs_test.e_lig, envs_test.s_lig, envs_test.r_lig, envs_test.n_lig,
-                envs_test.e_int, envs_test.s_int, envs_test.r_int)
-        print (actions.shape)
+        actions = a_apply(a_params, None,
+                envs_test.e_rec[0], envs_test.s_rec[0], envs_test.r_rec[0], envs_test.n_rec[0],
+                envs_test.e_lig[0], envs_test.s_lig[0], envs_test.r_lig[0], envs_test.n_lig[0],
+                envs_test.e_int[0], envs_test.s_int[0], envs_test.r_int[0])
+       
+        actions = jnp.concatenate((quat_from_pred(actions[None,:3]), actions[None,3:]), axis=-1)
 
-        c_lig_next, dmaps_next, \
+        dmaps, c_lig_next, \
         e_int_next, s_int_next, r_int_next = envs_test.step(envs_test.c_lig, actions)
         n_lig_next = jnp.concatenate(
                 [envs_test.n_lig[:,:,:-3], c_lig_next], axis=-1)
@@ -470,9 +475,9 @@ if __name__ == "__main__":
         out_models = unfold_entities(out_struc, 'M')
         out_struc = save_to_model(out_struc, out_models[-1], actions[0,:4], actions[0,4:-1])
         
-        mean_reward = jnp.mean(rewards)
+        reward = envs_test.get_rewards(dmaps)
         print (f'Completed episode {global_step+1} - {time.time()-sg}')
-        print (f'Writing --- Reward: {mean_reward}')
+        print (f'Writing --- Reward: {reward}')
 
     io.set_structure(out_struc)
     io.save('test.pdb')

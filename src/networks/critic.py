@@ -93,7 +93,7 @@ class Critic(hk.Module):
         
         # elaborate q-value
         q = self.out_block(g_int.globals)
-        q = (jax.nn.sigmoid(self.value(q))*100)-50
+        q = (jax.nn.sigmoid(self.value(q))*200)-100
 
         return q
 

@@ -14,9 +14,7 @@ from Bio.PDB.MMCIFParser import MMCIFParser
 from Bio.PDB.PDBParser import PDBParser
 from Bio.PDB.Selection import unfold_entities
 
-from coordinates import *
 from tables import *
-from graph import *
 from ops import *
 
 import pandas as pd
@@ -37,10 +35,10 @@ sasa = ShrakeRupley()
 #def filter_surface(array, surf_mask):
 #    return jnp.stack([line for line, asa in zip(array, surf_mask) if asa>=0.2], axis=0)
 
-def format_data(code, str1, str2, key, negative, enum=4, pad=400):
+def format_data(code, str1, str2, key, negative, enum=10, maxlen=400):
     structures = [str1, str2]
 
-    masks_pair, nodes_pair, cloud_pair = [], [], [] 
+    masks_pair, nodes_pair, cloud_pair, local_pair = [], [], [], [] 
     for idx, struc in enumerate(structures):    
         try:
             sasa.compute(struc, level='R')
@@ -50,7 +48,7 @@ def format_data(code, str1, str2, key, negative, enum=4, pad=400):
             return [code, None]
         struc = unfold_entities(struc, 'R')
         
-        masks, nodes, cloud = [], [], []
+        masks, nodes, cloud, local = [], [], [], []
         for residue in struc: 
             rid = residue.get_resname()
             if rid not in standard_residues_three: continue
@@ -62,39 +60,35 @@ def format_data(code, str1, str2, key, negative, enum=4, pad=400):
             res_rsa = max(residue.sasa, 1)/max_asa[rid]
             masks.append(res_rsa)
 
-            # get CA coordinates to compute edges
-            x, y, z = residue['CA'].get_coord()
-            cloud.append([x, y, z])
+            # get residue 1-hot
+            if idx == 0: nodes.append(residue_1hot[rid]+[1,0])
+            else: nodes.append(residue_1hot[rid]+[0,1])
 
-            # get atom types/ASA to compute node features
-            atoms = []
-            for atom in standard_atoms:
-                if atom not in residue: atoms.append(0)
-                else: atoms.append(max(residue[atom].sasa, 1)/max_asa[rid])
+            # get CA coordinates to compute local frames and edges
+            xca, yca, zca = residue['CA'].get_coord()
+            xc, yc, zc = residue['C'].get_coord()
+            xn, yn, zn = residue['N'].get_coord()
+            coordCA = jnp.array(residue['CA'].get_coord())
+            coordC = jnp.array([xc, yc, zc])
+            coordN = jnp.array([xn, yn, zn])
+            cloud.append([xca, yca, zca])
 
-            if idx == 0: nodes.append([res_rsa]+atoms+[1,0])
-            else: nodes.append([res_rsa]+atoms+[0,1])
-        
-        while len(nodes) < pad: 
-            nodes.append([0]*(len(standard_atoms)+3))
+            u_i = (coordN-coordCA)/jnp.linalg.norm((coordN-coordCA))
+            t_i = (coordC-coordCA)/jnp.linalg.norm((coordC-coordCA))
+            n_i = jnp.cross(u_i, t_i)/jnp.linalg.norm(jnp.cross(u_i, t_i))
+            v_i = jnp.cross(n_i, u_i)
+            local.append(jnp.stack((n_i, u_i, v_i), axis=0))
 
-        if len(masks) > pad: 
-            print (f'Sequence too long!')
-            return [code, None]
-        
         # store point cloud and surface mask
         masks_pair.append(jnp.array(masks))
         nodes_pair.append(jnp.array(nodes))
         cloud_pair.append(jnp.array(cloud))
+        local_pair.append(jnp.array(local))
     
-    if len(cloud_pair[0]) == 0 or len(cloud_pair[1]) == 0: 
-        print (f'One empty struct. in {code}')
+    if len(cloud_pair[0]) == 0 or len(cloud_pair[1]) == 0 \
+    or len(cloud_pair[0]) >= maxlen or len(cloud_pair[1]) >= maxlen: 
+        print (f'One empty/too long struct. in {code}')
         return [code, None]
-
-    #mask1 = jnp.array([0.3,0.4,0.6,0.3])
-    #mask2 = jnp.array([0.3,0.4,0.1])
-    #cloud1 = jnp.array([[1,0,0],[2,0,0],[10,0,0],[50,0,0]])
-    #cloud2 = jnp.array([[25,0,0],[100,0,0],[15,0,0]])
 
     # compute distance maps
     cloud1, cloud2 = cloud_pair
@@ -102,30 +96,17 @@ def format_data(code, str1, str2, key, negative, enum=4, pad=400):
     cmap2 = distances_from_cloud(cloud2[:,None,:], cloud2[None,:,:])
 
     # compute, pad and encode intra-chain edges
-    edges1, senders1, receivers1 = get_edges(cmap1, enum)
-    edges2, senders2, receivers2 = get_edges(cmap2, enum)
-
-    padlen1 = (pad-len(cloud1))*enum
-    padlen2 = (pad-len(cloud2))*enum
-    
-    edges1 = jnp.pad(edges1, (0, padlen1))
-    edges2 = jnp.pad(edges2, (0, padlen2))
-    senders1 = jnp.pad(senders1, (0, padlen1), constant_values=len(cloud1))
-    senders2 = jnp.pad(senders2, (0, padlen2), constant_values=len(cloud2)+pad)
-    receivers1 = jnp.pad(receivers1, (0, padlen1), constant_values=len(cloud1))
-    receivers2 = jnp.pad(receivers2, (0, padlen2), constant_values=len(cloud2)+pad)
-    
-    edges1 = encode_distances(edges1)
-    edges2 = encode_distances(edges2)
+    local1, local2 = local_pair
+    edges1, senders1, receivers1 = get_edges(cmap1, local1, local1, cloud1, cloud1, enum)
+    edges2, senders2, receivers2 = get_edges(cmap2, local2, local2, cloud2, cloud2, enum)
 
     # compute , pad and encode ground truth inter-chain edges 
     icmap = distances_from_cloud(cloud1[:,None,:], cloud2[None,:,:])
-    ledges12, lsenders12, lreceivers12,\
-    ledges21, lsenders21, lreceivers21 = get_interface_edges(icmap, enum, pad) 
+    ledges12, lsenders12, lreceivers12 = get_edges(icmap, local1, local2, cloud1, cloud2, enum)
+    
+    icmap = jnp.transpose(icmap)
+    ledges21, lsenders21, lreceivers21 = get_edges(icmap, local2, local1, cloud2, cloud1, enum) 
 
-    ledges12 = encode_distances(ledges12)
-    ledges21 = encode_distances(ledges21)
-  
     ledges = jnp.concatenate((ledges12, ledges21), axis=0)
     lsenders = jnp.concatenate((lsenders12, lsenders21), axis=0)
     lreceivers = jnp.concatenate((lreceivers12, lreceivers21), axis=0)
