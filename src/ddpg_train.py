@@ -2,6 +2,7 @@
 import os
 import time
 import glob
+import json
 import random
 import argparse
 import numpy as np
@@ -21,10 +22,11 @@ import jax.random as jrn
 from jax import tree_util
 from jraph import GraphsTuple
 from networks.critic import Critic
-from networks.actor import Actor
+from networks.equivariant_nets import Actor
 from replay_buffer import *
 from environment import *
 from ops import *
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -91,26 +93,6 @@ class TrainState(NamedTuple):
     target_params: hk.Params
     opt_state: optax.OptState
 
-def actor_fw(e_rec, s_rec, r_rec, n_rec,
-             e_lig, s_lig, r_lig, n_lig,
-             e_int, s_int, r_int):
-
-    actor = Actor(1, 64)
-
-    return actor(e_rec, s_rec, r_rec, n_rec,
-                 e_lig, s_lig, r_lig, n_lig,
-                 e_int, s_int, r_int)
-
-def critic_fw(e_rec, s_rec, r_rec, n_rec,
-              e_lig, s_lig, r_lig, n_lig,
-              e_int, s_int, r_int, action):
-
-    critic = Critic(1, 64)
-
-    return critic(e_rec, s_rec, r_rec, n_rec,
-                  e_lig, s_lig, r_lig, n_lig,
-                  e_int, s_int, r_int, action)
-
 def adjust_action(action):
     return jnp.concatenate((quat_from_pred(action[:,:3]), action[:,3:]), axis=-1)
 
@@ -140,6 +122,10 @@ def save_to_model(out_struc, ref_model, quat, tr, init=False):
 if __name__ == "__main__":
     s = time.time()
     args = parse_args()
+
+    with open(args.path+'/home/pozzati/complex_assembly/src/config.json') as j:
+        config = json.load(j)
+
     dataset, code = load_dataset(args.path, size=1)
     test, test_code = load_dataset(args.path, size=1)
 
@@ -184,6 +170,24 @@ if __name__ == "__main__":
     r_buffer = ReplayBuffer(buff_key, args.buffer_size,
                             envs.list, 4, 400, cpus[0])
 
+    def actor_fw(c_rec, f_rec, e_rec, s_rec, r_rec, m_rec,
+                 c_lig, f_lig, e_lig, s_lig, r_lig, m_lig):
+
+        actor = Actor('actor', 5, True, config)
+
+        return actor(c_rec, f_rec, e_rec, s_rec, r_rec, m_rec,
+                     c_lig, f_lig, e_lig, s_lig, r_lig, m_lig)
+
+    def critic_fw(e_rec, s_rec, r_rec, n_rec,
+                  e_lig, s_lig, r_lig, n_lig,
+                  e_int, s_int, r_int, action):
+
+        critic = Critic(1, 64)
+
+        return critic(e_rec, s_rec, r_rec, n_rec,
+                      e_lig, s_lig, r_lig, n_lig,
+                      e_int, s_int, r_int, action)
+
     # actor/critic models setup
     actor = hk.transform(actor_fw)
     critic = hk.transform(critic_fw)
@@ -192,15 +196,17 @@ if __name__ == "__main__":
     
     # actor parameters initialization
     a_params = actor.init(act_key, 
-            envs.e_rec[0], envs.s_rec[0], envs.r_rec[0], envs.n_rec[0],
-            envs.e_lig[0], envs.s_lig[0], envs.r_lig[0], envs.n_lig[0],
-            envs.e_int[0], envs.s_int[0], envs.r_int[0])
+            envs.c_rec[0], envs.f_rec[0], envs.e_rec[0],
+            envs.s_rec[0], envs.r_rec[0], envs.m_rec[0],
+            envs.c_lig[0], envs.f_lig[0], envs.e_lig[0],
+            envs.s_lig[0], envs.r_lig[0], envs.m_lig[0])
 
     # critic parameters initialization
     action = a_apply(a_params, None,
-            envs.e_rec[0], envs.s_rec[0], envs.r_rec[0], envs.n_rec[0],
-            envs.e_lig[0], envs.s_lig[0], envs.r_lig[0], envs.n_lig[0],
-            envs.e_int[0], envs.s_int[0], envs.r_int[0])
+            envs.c_rec[0], envs.f_rec[0], envs.e_rec[0], 
+            envs.s_rec[0], envs.r_rec[0], envs.m_rec[0],
+            envs.c_lig[0], envs.f_lig[0], envs.e_lig[0],
+            envs.s_lig[0], envs.r_lig[0], envs.m_lig[0])
     
     action = adjust_action(action[None,:])
 

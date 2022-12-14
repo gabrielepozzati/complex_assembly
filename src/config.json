@@ -1,11 +1,17 @@
 {
-  "base":"/storage/complex_assembly/",
-  "pdb":"/storage/databases/pdb/biounits_expanded/",
-  "uni":"/storage/databases/uniprot_sprot.dat",
-  "tmp":"/home/gabriele/Desktop/tmp/",
-  "seqres":"data/seqres",
-  "mmseq":{
-    "seq_id":"0.25",
-    "e_value":"0.001"
-  }
+ "base":"/storage/complex_assembly/",
+ "graph":{
+	"edge_number":10,
+    	"int_dist_threshold":8},
+ "actor":{
+    	"node_emb_dim":64,
+    	"iegmn_hid_dim":64,
+    	"iegmn_num":5,
+	"heads_num":50,
+	"share_layers":"False",
+	"fine_tune":"True",
+	"dropout":0.2,
+	"lkyrelu_slope":1e-2,
+	"coord_update_weight":0,
+	"feat_update_weight":0.5}
 }
