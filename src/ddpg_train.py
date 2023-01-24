@@ -27,11 +27,15 @@ from replay_buffer import *
 from environment import *
 from ops import *
 
+from Bio.PDB import PDBIO, PDBParser
+from Bio.PDB.Structure import Structure
+
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--path", type=str, 
-        default='/home/pozzati/complex_assembly/data/dataset_features/',
+        default='/home/pozzati/complex_assembly/',
         help="data path")
     parser.add_argument("--seed", type=int, default=42,
         help="seed of the experiment")
@@ -69,18 +73,14 @@ def load_dataset(path, size=None, skip=0):
     dataset = {}
     for idx, path in enumerate(glob.glob(path+'/*')):
         if idx < skip: continue
+        print (path)
         code = path.split('/')[-1].rstrip('.pkl')
         f = open(path, 'br')
         data = pkl.load(f)
 
         # restore device array type
-        for lbl in ['nodes', 'clouds', 'masks',
-                    'edges', 'senders', 'receivers']:
+        for lbl in ['coord_N', 'coord_C', 'coord_CA', 'nodes', 'masks']:
             data[lbl] = (jnp.array(data[lbl][0]),jnp.array(data[lbl][1]))
-
-        for lbl in ['ledges', 'lsenders', 'lreceivers', 
-                    'iedges', 'isenders', 'ireceivers']:
-            data[lbl] = jnp.array(data[lbl])
 
         dataset[code] = data
         count += 1
@@ -123,11 +123,11 @@ if __name__ == "__main__":
     s = time.time()
     args = parse_args()
 
-    with open(args.path+'/home/pozzati/complex_assembly/src/config.json') as j:
+    with open(args.path+'/src/config.json') as j:
         config = json.load(j)
 
-    dataset, code = load_dataset(args.path, size=1)
-    test, test_code = load_dataset(args.path, size=1)
+    dataset, code = load_dataset(args.path+'data/dataset_features/', size=1)
+    test, test_code = load_dataset(args.path+'data/dataset_features/', size=1)
 
     io = PDBIO()
     pdbp = PDBParser(QUIET=True)
@@ -138,15 +138,15 @@ if __name__ == "__main__":
     out_struc = Structure('test')
 
     # save structures of starting models
-    rstruc = pdbp.get_structure('', rpath)
-    cm = jnp.array(test[test_code]['init_rt'][0][0])
-    quat = jnp.array(test[test_code]['init_rt'][0][1])
-    out_struc = save_to_model(out_struc, rstruc[0], quat, cm, init=True)
+#    rstruc = pdbp.get_structure('', rpath)
+#    cm = jnp.array(test[test_code]['init_rt'][0][0])
+#    quat = jnp.array(test[test_code]['init_rt'][0][1])
+#    out_struc = save_to_model(out_struc, rstruc[0], quat, cm, init=True)
 
-    lstruc = pdbp.get_structure('', lpath)
-    cm = jnp.array(test[test_code]['init_rt'][1][0])
-    quat = jnp.array(test[test_code]['init_rt'][1][1])
-    out_struc = save_to_model(out_struc, lstruc[0], quat, cm, init=True)
+#    lstruc = pdbp.get_structure('', lpath)
+#    cm = jnp.array(test[test_code]['init_rt'][1][0])
+#    quat = jnp.array(test[test_code]['init_rt'][1][1])
+#    out_struc = save_to_model(out_struc, lstruc[0], quat, cm, init=True)
 
     # devices
     cpus = jax.devices('cpu')
@@ -159,16 +159,16 @@ if __name__ == "__main__":
     key, act_key, crit_key = jrn.split(key, 3)
 
     # environment setup
-    envs = DockingEnv(dataset, 4, 400, env_key)
-    envs_test = DockingEnv(test, 4, 400, env_key)
-    print (envs_test.list)
-    print (envs_test.e_rec.shape, envs_test.s_rec.shape, envs_test.r_rec.shape, envs_test.n_rec.shape,
-           envs_test.e_lig.shape, envs_test.s_lig.shape, envs_test.r_lig.shape, envs_test.n_lig.shape,
-           envs_test.e_int.shape, envs_test.s_int.shape, envs_test.r_int.shape)
+    envs = DockingEnv(dataset, 10, 400, env_key)
+    envs_test = DockingEnv(test, 10, 400, env_key)
+    #print (envs_test.list)
+    #print (envs_test.e_rec.shape, envs_test.s_rec.shape, envs_test.r_rec.shape, envs_test.n_rec.shape,
+    #       envs_test.e_lig.shape, envs_test.s_lig.shape, envs_test.r_lig.shape, envs_test.n_lig.shape,
+    #       envs_test.e_int.shape, envs_test.s_int.shape, envs_test.r_int.shape)
 
     # replay buffer setup
     r_buffer = ReplayBuffer(buff_key, args.buffer_size,
-                            envs.list, 4, 400, cpus[0])
+                            envs.list, 10, 400, cpus[0])
 
     def actor_fw(c_rec, f_rec, e_rec, s_rec, r_rec, m_rec,
                  c_lig, f_lig, e_lig, s_lig, r_lig, m_lig):
@@ -178,15 +178,13 @@ if __name__ == "__main__":
         return actor(c_rec, f_rec, e_rec, s_rec, r_rec, m_rec,
                      c_lig, f_lig, e_lig, s_lig, r_lig, m_lig)
 
-    def critic_fw(e_rec, s_rec, r_rec, n_rec,
-                  e_lig, s_lig, r_lig, n_lig,
-                  e_int, s_int, r_int, action):
+    def critic_fw(c_rec, f_rec, e_rec, s_rec, r_rec, m_rec,
+                  c_lig, f_lig, e_lig, s_lig, r_lig, m_lig, action):
 
-        critic = Critic(1, 64)
+        critic = Critic('critic', 5, True, config)
 
-        return critic(e_rec, s_rec, r_rec, n_rec,
-                      e_lig, s_lig, r_lig, n_lig,
-                      e_int, s_int, r_int, action)
+        return critic(c_rec, f_rec, e_rec, s_rec, r_rec, m_rec,
+                      c_lig, f_lig, e_lig, s_lig, r_lig, m_lig, action)
 
     # actor/critic models setup
     actor = hk.transform(actor_fw)
@@ -196,24 +194,26 @@ if __name__ == "__main__":
     
     # actor parameters initialization
     a_params = actor.init(act_key, 
-            envs.c_rec[0], envs.f_rec[0], envs.e_rec[0],
-            envs.s_rec[0], envs.r_rec[0], envs.m_rec[0],
-            envs.c_lig[0], envs.f_lig[0], envs.e_lig[0],
-            envs.s_lig[0], envs.r_lig[0], envs.m_lig[0])
+            envs.c_rec_CA[0], envs.f_rec[0], envs.edges_rec[0],
+            envs.nodes_rec[0], envs.neighs_rec[0], envs.l_rec[0],
+            envs.c_lig_CA[0], envs.f_lig[0], envs.edges_lig[0],
+            envs.nodes_lig[0], envs.neighs_lig[0], envs.l_lig[0])
 
     # critic parameters initialization
     action = a_apply(a_params, None,
-            envs.c_rec[0], envs.f_rec[0], envs.e_rec[0], 
-            envs.s_rec[0], envs.r_rec[0], envs.m_rec[0],
-            envs.c_lig[0], envs.f_lig[0], envs.e_lig[0],
-            envs.s_lig[0], envs.r_lig[0], envs.m_lig[0])
+            envs.c_rec_CA[0], envs.f_rec[0], envs.edges_rec[0],
+            envs.nodes_rec[0], envs.neighs_rec[0], envs.l_rec[0],
+            envs.c_lig_CA[0], envs.f_lig[0], envs.edges_lig[0],
+            envs.nodes_lig[0], envs.neighs_lig[0], envs.l_lig[0])
     
     action = adjust_action(action[None,:])
 
     c_params = critic.init(crit_key,
-            envs.e_rec[0], envs.s_rec[0], envs.r_rec[0], envs.n_rec[0],
-            envs.e_lig[0], envs.s_lig[0], envs.r_lig[0], envs.n_lig[0],
-            envs.e_int[0], envs.s_int[0], envs.r_int[0], action)
+            envs.c_rec_CA[0], envs.f_rec[0], envs.e_rec[0], 
+            envs.s_rec[0], envs.r_rec[0], envs.m_rec[0],
+            envs.c_lig_CA[0], envs.f_lig[0], envs.e_lig[0], 
+            envs.s_lig[0], envs.r_lig[0], envs.m_rec[0],
+            action)
 
     # duplicate and group actor/critic params, init optimizer
     a_optimiser = optax.adam(learning_rate=args.learning_rate)
@@ -344,27 +344,29 @@ if __name__ == "__main__":
         keys3 = jnp.stack(jrn.split(key, envs.number))
 
         # run actor
+        edges, nodes, neighs = envs.get_edges(
+                c_lig_N, c_lig_N, c_lig_C, c_lig_C, c_lig_CA, c_lig_CA, 10)
+
         actions = vmap(partial(a_apply, a_params, None))(
-                envs.e_rec, envs.s_rec, envs.r_rec, envs.n_rec,
-                envs.e_lig, envs.s_lig, envs.r_lig, envs.n_lig,
-                envs.e_int, envs.s_int, envs.r_int)
+                envs.c_rec, envs.f_rec, envs.e_rec, envs.s_rec, envs.r_rec, envs.m_rec,
+                envs.c_lig, envs.f_lig, envs.e_lig, envs.s_lig, envs.r_lig, envs.m_lig)
 
         # add noise to action
         noiseless = actions
-        actions = vmap(lambda a, x, y, z: jnp.concatenate(
-                (jnp.squeeze(a[:3] + jrn.normal(x, shape=(3,))*args.rot_noise),
-                 jnp.squeeze(a[3:-1] + jrn.normal(y, shape=(3,))*args.tr_noise),
-                 a[-1] + jrn.normal(z, shape=(1,))*args.rot_noise),
-                axis=-1))(actions, keys1, keys2, keys3)
+        actions = vmap(lambda x, y, z: jnp.concatenate(
+                (jnp.squeeze(x[:9] + jrn.normal(y, shape=(9,))*args.rot_noise),
+                 jnp.squeeze(x[-3:] + jrn.normal(z, shape=(3,))*args.tr_noise)),
+                axis=-1))(actions, keys1, keys2)
 
-        actions = jnp.concatenate((quat_from_pred(actions[:,:3]), actions[:,3:]), axis=-1)
+        #actions = jnp.concatenate((quat_from_pred(actions[:,:3]), actions[:,3:]), axis=-1)
         
         # get new state after executing action
-        dmaps, c_lig_next, \
-        e_int_next, s_int_next, r_int_next = envs.step(envs.c_lig, actions)
-        n_lig_next = jnp.concatenate(
-                [envs.n_lig[:,:,:-3], c_lig_next], axis=-1)
+        dmaps, c_lig_N, c_lig_C, c_lig_CA = envs.step(
+                envs.c_lig_N, envs.c_lig_C, envs.c_lig_CA, actions)
         
+        edges, nodes, neighs = envs.get_edges(
+                c_lig_N, c_lig_N, c_lig_C, c_lig_C, c_lig_CA, c_lig_CA, 10)
+
         # get reward for last action
         rewards = envs.get_rewards(dmaps)
         rewards_episode.append(rewards)
@@ -372,10 +374,10 @@ if __name__ == "__main__":
         # store experiences in replay buffer
         r_buffer.buffer, r_buffer.actual_size = r_buffer.add_to_replay(
             r_buffer.buffer,
-            {'prev_edges':envs.e_int, 'next_edges':e_int_next,
-             'prev_nodes':envs.n_lig, 'next_nodes':n_lig_next,
-             'prev_senders':envs.s_int, 'next_senders':s_int_next,
-             'prev_receivers':envs.r_int, 'next_receivers':r_int_next,
+            {'prev_coord':envs.c_lig_CA, 'next_coord':c_lig_CA,
+             #'prev_edges':envs.e_lig, 'next_edges':e_lig_next,
+             #'prev_senders':envs.s_lig, 'next_senders':s_lig_next,
+             #'prev_receivers':envs.r_lig, 'next_receivers':r_lig_next,
              'actions':actions, 'rewards':rewards})
 
         # update state for next iteration

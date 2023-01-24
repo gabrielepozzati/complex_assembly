@@ -38,7 +38,8 @@ sasa = ShrakeRupley()
 def format_data(code, str1, str2, key, negative, enum=10, maxlen=400):
     structures = [str1, str2]
 
-    masks_pair, nodes_pair, cloud_pair, local_pair = [], [], [], [] 
+    masks_pair, nodes_pair = [], []
+    CA_pair, C_pair, N_pair = [], [], []
     for idx, struc in enumerate(structures):    
         try:
             sasa.compute(struc, level='R')
@@ -48,7 +49,8 @@ def format_data(code, str1, str2, key, negative, enum=10, maxlen=400):
             return [code, None]
         struc = unfold_entities(struc, 'R')
         
-        masks, nodes, cloud, local = [], [], [], []
+        masks, nodes = [], [], 
+        coordN, coordC, coordCA = [], [], []
         for residue in struc: 
             rid = residue.get_resname()
             if rid not in standard_residues_three: continue
@@ -65,96 +67,87 @@ def format_data(code, str1, str2, key, negative, enum=10, maxlen=400):
             else: nodes.append(residue_1hot[rid]+[0,1])
 
             # get CA coordinates to compute local frames and edges
-            xca, yca, zca = residue['CA'].get_coord()
-            xc, yc, zc = residue['C'].get_coord()
-            xn, yn, zn = residue['N'].get_coord()
-            coordCA = jnp.array(residue['CA'].get_coord())
-            coordC = jnp.array([xc, yc, zc])
-            coordN = jnp.array([xn, yn, zn])
-            cloud.append([xca, yca, zca])
-
-            u_i = (coordN-coordCA)/jnp.linalg.norm((coordN-coordCA))
-            t_i = (coordC-coordCA)/jnp.linalg.norm((coordC-coordCA))
-            n_i = jnp.cross(u_i, t_i)/jnp.linalg.norm(jnp.cross(u_i, t_i))
-            v_i = jnp.cross(n_i, u_i)
-            local.append(jnp.stack((n_i, u_i, v_i), axis=0))
+            coordCA.append(jnp.array(residue['CA'].get_coord()))
+            coordC.append(jnp.array(residue['C'].get_coord()))
+            coordN.append(jnp.array(residue['N'].get_coord()))
 
         # store point cloud and surface mask
         masks_pair.append(jnp.array(masks))
         nodes_pair.append(jnp.array(nodes))
-        cloud_pair.append(jnp.array(cloud))
-        local_pair.append(jnp.array(local))
-    
-    if len(cloud_pair[0]) == 0 or len(cloud_pair[1]) == 0 \
-    or len(cloud_pair[0]) >= maxlen or len(cloud_pair[1]) >= maxlen: 
+        CA_pair.append(jnp.array(coordCA))
+        C_pair.append(jnp.array(coordC))
+        N_pair.append(jnp.array(coordN))
+
+    if len(CA_pair[0]) == 0 or len(CA_pair[1]) == 0 \
+    or len(CA_pair[0]) >= maxlen or len(CA_pair[1]) >= maxlen: 
         print (f'One empty/too long struct. in {code}')
         return [code, None]
 
-    # compute distance maps
-    cloud1, cloud2 = cloud_pair
-    cmap1 = distances_from_cloud(cloud1[:,None,:], cloud1[None,:,:])
-    cmap2 = distances_from_cloud(cloud2[:,None,:], cloud2[None,:,:])
-
-    # compute, pad and encode intra-chain edges
-    local1, local2 = local_pair
-    edges1, senders1, receivers1 = get_edges(cmap1, local1, local1, cloud1, cloud1, enum)
-    edges2, senders2, receivers2 = get_edges(cmap2, local2, local2, cloud2, cloud2, enum)
-
-    # compute , pad and encode ground truth inter-chain edges 
-    icmap = distances_from_cloud(cloud1[:,None,:], cloud2[None,:,:])
-    ledges12, lsenders12, lreceivers12 = get_edges(icmap, local1, local2, cloud1, cloud2, enum)
-    
-    icmap = jnp.transpose(icmap)
-    ledges21, lsenders21, lreceivers21 = get_edges(icmap, local2, local1, cloud2, cloud1, enum) 
-
-    ledges = jnp.concatenate((ledges12, ledges21), axis=0)
-    lsenders = jnp.concatenate((lsenders12, lsenders21), axis=0)
-    lreceivers = jnp.concatenate((lreceivers12, lreceivers21), axis=0)
-
-    # sanity check on negatome examples not having contacts
-    if jnp.max(icmap) <= 8 and negative:
-        print (f'Existing interface in negative example: {code}')
-        return [code, None]
+#    # compute distance maps
+#    cloud1, cloud2 = CA_pair
+#    cmap1 = distances_from_cloud(cloud1[:,None,:], cloud1[None,:,:])
+#    cmap2 = distances_from_cloud(cloud2[:,None,:], cloud2[None,:,:])
+#
+#    # compute, pad and encode intra-chain edges
+#    local1, local2 = local_pair
+#    edges1, senders1, receivers1 = get_edges(cmap1, local1, local1, cloud1, cloud1, enum)
+#    edges2, senders2, receivers2 = get_edges(cmap2, local2, local2, cloud2, cloud2, enum)
+#
+#    # compute , pad and encode ground truth inter-chain edges 
+#    icmap = distances_from_cloud(cloud1[:,None,:], cloud2[None,:,:])
+#    ledges12, lsenders12, lreceivers12 = get_edges(icmap, local1, local2, cloud1, cloud2, enum)
+#    
+#    icmap = jnp.transpose(icmap)
+#    ledges21, lsenders21, lreceivers21 = get_edges(icmap, local2, local1, cloud2, cloud1, enum) 
+#
+#    ledges = jnp.concatenate((ledges12, ledges21), axis=0)
+#    lsenders = jnp.concatenate((lsenders12, lsenders21), axis=0)
+#    lreceivers = jnp.concatenate((lreceivers12, lreceivers21), axis=0)
+#
+#    # sanity check on negatome examples not having contacts
+#    if jnp.max(icmap) <= 8 and negative:
+#        print (f'Existing interface in negative example: {code}')
+#        return [code, None]
 
     # randomly rotate and space input clouds
-    key1, key2 = jax.random.split(key)
+#    key1, key2 = jax.random.split(key)
     #cloud1, cloud2, rt1, rt2 = initialize_clouds(cloud1, cloud2, cmap1, cmap2, key1)
     rt1 = rt2 = [jnp.array([0.,0.,0.]), jnp.array([1.,0.,0.,0.])]
-    mask1, mask2 = masks_pair
-
-    # compute, pad and encode initial inter-chain edges
-    icmap = distances_from_cloud(cloud1[:,None,:], cloud2[None,:,:])
-    iedges12, isenders12, ireceivers12,\
-    iedges21, isenders21, ireceivers21 = get_interface_edges(icmap, enum, pad)
-    
-    iedges12 = encode_distances(iedges12)
-    iedges21 = encode_distances(iedges21)
-
-    iedges = jnp.concatenate((iedges12, iedges21), axis=0)
-    isenders = jnp.concatenate((isenders12, isenders21), axis=0)
-    ireceivers = jnp.concatenate((ireceivers12, ireceivers21), axis=0)
+#    mask1, mask2 = masks_pair
+#
+#    # compute, pad and encode initial inter-chain edges
+#    icmap = distances_from_cloud(cloud1[:,None,:], cloud2[None,:,:])
 
     # pad clouds and masks
-    padlen1 = pad-len(cloud1)
-    padlen2 = pad-len(cloud2)
-    mask1 = jnp.concatenate((mask1, jnp.zeros((padlen1,))), axis=0)
-    mask2 = jnp.concatenate((mask2, jnp.zeros((padlen2,))), axis=0)
-    cloud1 = jnp.concatenate((cloud1, jnp.zeros((padlen1, 3))), axis=0)
-    cloud2 = jnp.concatenate((cloud2, jnp.zeros((padlen2, 3))), axis=0)
+    padlen1 = maxlen-len(nodes_pair[0])
+    padlen2 = maxlen-len(nodes_pair[1])
+    masks_pair = [
+            jnp.concatenate((masks_pair[0], jnp.zeros((padlen1,))), axis=0),
+            jnp.concatenate((masks_pair[1], jnp.zeros((padlen2,))), axis=0)]
+
+    N_pair = [
+            jnp.concatenate((N_pair[0], jnp.zeros((padlen1, 3))), axis=0),
+            jnp.concatenate((N_pair[1], jnp.zeros((padlen2, 3))), axis=0)]
+
+    C_pair = [
+            jnp.concatenate((C_pair[0], jnp.zeros((padlen1, 3))), axis=0),
+            jnp.concatenate((C_pair[1], jnp.zeros((padlen2, 3))), axis=0)]
+
+    CA_pair = [
+            jnp.concatenate((CA_pair[0], jnp.zeros((padlen1, 3))), axis=0),
+            jnp.concatenate((CA_pair[1], jnp.zeros((padlen2, 3))), axis=0)]
+
+    nodes_pair = [
+            jnp.concatenate((nodes_pair[0], jnp.zeros((padlen1, 22))), axis=0),
+            jnp.concatenate((nodes_pair[1], jnp.zeros((padlen2, 22))), axis=0)]
 
     print (f'Finished {code}')
-    return [code, {'ledges':ledges,
-                   'iedges':iedges,
-                   'lsenders':lsenders,
-                   'isenders':isenders,
-                   'lreceivers':lreceivers,
-                   'ireceivers':ireceivers,
-                   'edges':[edges1, edges2],
-                   'senders':[senders1, senders2],
-                   'receivers':[receivers1, receivers2],
-                   'clouds':[cloud1, cloud2], 'masks':[mask1,mask2],
-                   'init_rt':[rt1, rt2],
-                   'nodes':nodes_pair}]
+    return [code, {'coord_N':N_pair, 
+                   'coord_C':C_pair,
+                   'coord_CA':CA_pair,
+                   'masks':masks_pair,
+                   'nodes':nodes_pair,
+                   'init_rt':[rt1, rt2]}]
     
 
 def plot_dataset_stats(dataset, subset_paths):

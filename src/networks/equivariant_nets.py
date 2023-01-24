@@ -3,9 +3,10 @@ import sys
 import math
 import haiku as hk
 import jax.numpy as jnp
+import jax.random as random
 
 def get_non_lin(nl_type, negative_slope):
-    assert nl_type == 'lkyrelu' or nl_type == 'swish',
+    assert nl_type == 'lkyrelu' or nl_type == 'swish' \
             'type must be lkyrelu or swish'
 
     if nl_type == 'swish': return jax.nn.SiLU()
@@ -14,7 +15,7 @@ def get_non_lin(nl_type, negative_slope):
 
 
 def get_layer_norm(name, ln_type, ax):
-    assert ln_type=='BN' or ln_type=='LN' or ln_type == 'ID',
+    assert ln_type=='BN' or ln_type=='LN' or ln_type == 'ID' \
             'type must be BN, LN or ID'
 
     if ln_type == 'BN': return hk.BatchNorm(create_scale=True, create_offset=True, name=name)
@@ -31,7 +32,7 @@ def apply_layer_norm(g, h, node_type, norm_type, norm_layer):
 
 
 def get_initializer(init_type, input_shape):
-    assert init_type=='zeros' or init_type=='relu' or init_type=='linear',
+    assert init_type=='zeros' or init_type=='relu' or init_type=='linear' \
             'type must be zeros or relu or linear'
     
     if init_type == 'zeros': return hk.initializers.Constant(0.0)
@@ -98,9 +99,13 @@ class Linear(hk.Module):
         
         self.name = name
         self.in_dims = in_dims
-        self.out_dims = len(self.out_shape)
-        if type(out_shape) is int: self.out_shape = (out_shape,)
-        else: self.out_shape = tuple(out_shape)
+        if type(out_shape) is int:
+            self.out_dims = 1
+            self.out_shape = (out_shape,)
+        else:
+            self.out_dims = len(out_shape)
+            self.out_shape = tuple(out_shape)
+        
         self.initializer = initializer
         self.use_bias = use_bias
         self.bias_init = bias_init
@@ -131,13 +136,11 @@ class Linear(hk.Module):
 class IEGMN_Layer(hk.Module):
 
     def __init__(self,
-                 name, prng_key,
-                 n_hid_dim, n_out_dim,
+                 name, n_hid_dim, n_out_dim,
                  fine_tune, config):
 
         super().__init__(name=name)
         
-        dropout = None
         self.cross_msgs = None
         layer_norm_coors = None
         self.final_h_layer_norm = None
@@ -154,40 +157,35 @@ class IEGMN_Layer(hk.Module):
         self.n_out_dim = n_out_dim
         self.fine_tune = fine_tune
 
-        self.edge_mlp = hk.Sequential((
-            Linear(name+'_linear_1', n_out_dim),
-            hk.Dropout(dropout),
-            get_non_lin(nonlin, lkyrelu_slope),
-            get_layer_norm(name+'_norm_1', norm_type, n_out_dim),
-            nn.Linear(name+'_linear_2', n_out_dim)))
-
-        self.node_norm1 = get_layer_norm(name+'_norm_2', norm_type, n_out_dim)
+        self.edge_fc1 = Linear(name+'_linear_1', n_out_dim)
+        #dropout
+        self.edge_act1 = get_non_lin(nonlin, lkyrelu_slope)
+        self.edge_ln1 = get_layer_norm(name+'_norm_1', norm_type, n_out_dim)
+        self.edge_fc2 = Linear(name+'_linear_2', n_out_dim)
 
         self.att_mlp_Q = hk.Sequential(
             Linear(name+'_linear_Q1', n_hid_dim, bias=False),
             get_non_lin(nonlin, lkyrelu_slope))
-
+        
         self.att_mlp_K = hk.Sequential(
             Linear(name+'_linear_K1', n_hid_dim, bias=False),
             get_non_lin(nonlin, lkyrelu_slope))
-
+        
         self.att_mlp_V = Linear(name+'_linear_V1', n_hid_dim, bias=False)
 
-        self.node_mlp = hk.Sequential(
-            Linear(name+'_linear_3', n_hid_dim),
-            hk.Dropout(dropout),
-            get_non_lin(nonlin, lkyrelu_slope),
-            get_layer_norm(name+'_norm_3', norm_type, n_hid_dim),
-            Linear(name+'_linear_4', n_out_dim))
+        self.node_ln1 = get_layer_norm(name+'_norm_2', norm_type, n_out_dim)
+        self.node_fc1 = Linear(name+'_linear_3', n_hid_dim)
+        #dropout
+        self.node_act1 = get_non_lin(nonlin, lkyrelu_slope)
+        self.node_ln2 = get_layer_norm(name+'_norm_3', norm_type, n_hid_dim)
+        self.node_fc2 = Linear(name+'_linear_4', n_out_dim)
+        self.node_ln3 = get_layer_norm(name+'_norm_4', norm_type, n_out_dim)
 
-        self.node_norm2 = get_layer_norm(name+'_norm_4', norm_type, n_out_dim)
-
-        self.coors_mlp = hk.Sequential(
-            Linear(name+'_linear_5', n_out_dim),
-            hk.Dropout(dropout),
-            get_non_lin(nonlin, lkyrelu_slope),
-            get_layer_norm(name+'_norm_5', norm_type, n_out_dim),
-            Linear(name+'_linear_6', 1))
+        self.coors_fc1 = Linear(name+'_linear_5', n_out_dim)
+        #dropout
+        self.coors_act1 = get_non_lin(nonlin, lkyrelu_slope)
+        self.coors_ln1 = get_layer_norm(name+'_norm_5', norm_type, n_out_dim)
+        self.coors_fc2 = Linear(name+'_linear_6', 1)
 
         if self.fine_tune:
             self.att_mlp_fine_Q = hk.Sequential(
@@ -203,9 +201,9 @@ class IEGMN_Layer(hk.Module):
                 get_non_lin(nonlin, lkyrelu_slope),
                 Linear(name+'_linear_V3', 1))
 
-    def __call__(self,
-                 c_rec, f_rec, oc_rec, of_rec, e_rec, s_rec, r_rec, m_rec
-                 c_lig, f_lig, oc_lig, of_lig, e_lig, s_lig, r_lig, m_lig)
+    def __call__(self, key, is_training,
+                 c_rec, f_rec, oc_rec, of_rec, e_rec, s_rec, r_rec, m_rec,
+                 c_lig, f_lig, oc_lig, of_lig, e_lig, s_lig, r_lig, m_lig):
         '''
         prefix                          shape
         c = coordinates                 (B,N,3)
@@ -229,7 +227,7 @@ class IEGMN_Layer(hk.Module):
         12: - distance features
         '''
 
-        def _edges_mpass_input(f, c, s, r, e):
+        def _edges_mp_input(f, c, s, r, e):
             ij_dist = vmap(lambda x, y: 
                     jnp.exp(-jnp.sum((x-y)**2)/sigma))(c[r], c[s])
 
@@ -242,22 +240,42 @@ class IEGMN_Layer(hk.Module):
             # missing weight matrix here?
             return jnp.matmul(a, values)
 
-        def _neigh_coord_update(c, m, s, r):
-            neigh_map_update = vmap(lambda x1, x2, y, z: (x1-x2)*self.coors_mlp(y[z]))
+        def _neigh_coord_update(is_training, c, m, s, r):
+
+            def _coors_mlp(is_training, x):
+                x = self.coors_fc1(x)
+                if is_training: x = hk.dropout(key1, self.dropout, x)
+                x = self.coors_act1(x)
+                x = self.coors_ln1(x)
+                return self.coors_fc2(x)
+            
+            coors_mlp = partial(is_training)
+            neigh_map_update = vmap(lambda x1, x2, y, z: (x1-x2)*coors_mlp(y[z]))
             updates = neigh_map_update(c[s], c[r], m, m_indices)
             updates = jnp.reshape(updates, shape=(c.shape[0], 10, 3))
             return jnp.sum(updates, axis=1)
+
+        key1, key2, key3 = random.split(key, num=3)
 
         # compute m_i
         sigma = jnp.indices((15,))[0]
         grouped_shape = (m_rec.shape[0], 10, m_rec.shape[1])
         
-        m_edges_mpass_input = vmap(_edges_mpass_input)
-        empi_rec = m_edges_mpass_input(f_rec, c_rec, s_rec, r_rec, e_rec)
-        empi_lig = m_edges_mpass_input(f_lig, c_lig, s_lig, r_lig, e_lig)
+        m_edges_mp_input = vmap(_edges_mp_input)
+        empi_rec = m_edges_mp_input(f_rec, c_rec, s_rec, r_rec, e_rec)
+        empi_lig = m_edges_mp_input(f_lig, c_lig, s_lig, r_lig, e_lig)
 
-        mji_rec = self.edge_mlp(empi_rec)
-        mji_lig = self.edge_mlp(empi_lig)
+        mji_rec = self.edge_fc1(empi_rec)
+        if is_training: mji_rec = hk.dropout(key1, self.dropout, mji_rec)
+        mji_rec = self.edge_act1(mji_rec)
+        mji_rec = self.edge_ln1(mji_rec)
+        mji_rec = self.edge_fc2(mji_rec)
+ 
+        mji_lig = self.edge_fc1(empi_lig)
+        if is_training: mji_lig = hk.dropout(key1, self.dropout, mji_lig)
+        mji_lig = self.edge_act1(mji_lig)
+        mji_lig = self.edge_ln1(mji_lig)
+        mji_lig = self.edge_fc2(mji_lig)
         
         grouped_shape = (m_rec.shape[0], 10, m_rec.shape[1])
         mji_rec_grouped = jnp.reshape(mji_rec, shape=grouped_shape)
@@ -295,7 +313,7 @@ class IEGMN_Layer(hk.Module):
             c_rec_att = compute_cross_attention(
                     self.att_mlp_fine_Q(f_rec),
                     self.att_mlp_fine_K(f_lig),
-                    c_lig, mask))
+                    c_lig, mask)
 
             c_lig_att = compute_cross_attention(
                     self.att_mlp_fine_Q(f_lig),
@@ -325,29 +343,32 @@ class IEGMN_Layer(hk.Module):
         return c_rec_up, f_rec_up, c_lig_up, f_lig_up
 
 
-class Agent(hk.Module):
+class Actor(hk.Module):
 
     def __init__(self, name, n_lays, fine_tune, config):
         super().__init__(name=name)
 
         n_inp_dim = config['actor']['node_emb_dim']
-        n_hid_dim = config['actor']['iegmn_lay_hid_dim']
+        n_hid_dim = config['actor']['iegmn_hid_dim']
         lkyrelu_slope = config['actor']['lkyrelu_slope']
         heads_num = config['actor']['heads_num']
         dropout = config['actor']['dropout']
+
+        key = random.PRNGKey(config['random_seed'])
+        key1, key2, key3 = random.split(key, num=3)
 
         self.emb_layer = hk.Embed(vocab_size=21, embed_dim=n_inp_dim)
 
         self.iegmn_layers = []
 
         self.iegmn_layers.append(
-            IEGMN_Layer(name+'_iegmn1', key,
+            IEGMN_Layer(name+'_iegmn1', key1,
                         n_inp_dim,
                         n_hid_dim,
                         fine_tune, config))
 
         if config['actor']['shared_layers']:       
-            shared_layer = IEGMN_Layer(name+'_iegmn2', key,
+            shared_layer = IEGMN_Layer(name+'_iegmn2', key2,
                                        n_hid_dim,
                                        n_hid_dim,
                                        fine_tune, config)
@@ -358,7 +379,7 @@ class Agent(hk.Module):
             for layer_idx in range(1, n_lays):
                 iegmn_name = name+'_iegmn'+str(layer_idx+1)
                 self.iegmn_layers.append(
-                    IEGMN_Layer(iegmn_name, key,
+                    IEGMN_Layer(iegmn_name, key3,
                                 n_hid_dim,
                                 n_hid_dim,
                                 fine_tune, config))
@@ -379,10 +400,10 @@ class Agent(hk.Module):
 
         def centroid_attention(feat, feat_mean, coord):
             key = jnp.reshape(self.att_mlp_key_ROT(feat), (-1, self.num_att_heads, d))
-            key = jnp.transpose(key, axes=(0,1))
+            key = key.transpose(0,1,2)                                                                          # (H,N,d)
 
             query = jnp.reshape(self.att_mlp_query_ROT(feat_mean), (1, self.num_att_heads, d))
-            query = jnp.transpose(jnp.transpose(query, axes=(0,1)), axes=(1,2))
+            query = query.transpose(0,2,1)                                                                      # (H,d,N)
 
             att_vec = jnp.reshape(jax.nn.softmax(key @ (query/jnp.sqrt(d)), dim=1), (self.num_att_heads, -1))
             att_vec = att_vec @ coord
@@ -442,37 +463,9 @@ class Critic(hk.Module):
     def __init__(self, name, n_lays, config):
         super().__init__(name=name)
 
-        n_inp_dim = config['actor']['node_emb_dim']
-        n_hid_dim = config['actor']['iegmn_lay_hid_dim']
-        lkyrelu_slope = config['actor']['lkyrelu_slope']
-        heads_num = config['actor']['heads_num']
-        dropout = config['actor']['dropout']
+        self.actor_submodule = Actor(name, n_lays, True, config)
 
-        self.emb_layer = hk.Embed(vocab_size=21, embed_dim=n_inp_dim)
-
-        self.iegmn_layers = []
-
-        self.iegmn_layers.append(
-            IEGMN_Layer(name+'_iegmn1', key,
-                        n_inp_dim,
-                        n_hid_dim,
-                        False, config))
-
-        for layer_idx in range(1, n_lays):
-            iegmn_name = name+'_iegmn'+str(layer_idx+1)
-            self.iegmn_layers.append(
-                IEGMN_Layer(iegmn_name, key,
-                            n_hid_dim,
-                            n_hid_dim,
-                            False, config))
-
-        for layer_idx in range(1, n_lays):
-            iegmn_name = name+'_iegmn_FT'+str(layer_idx+1)
-            self.iegmn_layers.append(
-                IEGMN_Layer(iegmn_name, key,
-                            n_hid_dim,
-                            n_hid_dim,
-                            True, config))
+        # final score estimation attention / coordinates
 
         self.att_score_coord_Q = hk.Sequential(
                 Linear(name+'_linear_Qc', heads_num*n_hid_dim, bias=False),
@@ -486,7 +479,13 @@ class Critic(hk.Module):
                 Linear(name+'_linear_Vc', heads_num*n_hid_dim),
                 get_non_lin(nonlin, lkyrelu_slope))
 
-        self.att_score_coord = Linear(name+'_linear_c', n_hid_dim, in_dims=2)
+        self.att_score_coord = hk.Sequential(
+            Linear(name+'_linear_2', n_hid_dim, in_dims=2),
+            hk.Dropout(dropout),
+            get_non_lin(nonlin, lkyrelu_slope),
+            get_layer_norm(name+'_norm_1', norm_type, n_out_dim))
+
+        # final score estimation attention / features
 
         self.att_score_feat_Q = hk.Sequential(
                 Linear(name+'_linear_Qf', heads_num*n_hid_dim, bias=False),
@@ -500,7 +499,11 @@ class Critic(hk.Module):
                 Linear(name+'_linear_Vf', heads_num*n_hid_dim),
                 get_non_lin(nonlin, lkyrelu_slope))
 
-        self.att_score_feat = Linear(name+'_linear_f', n_hid_dim, in_dims=2)
+        self.att_score_feat = hk.Sequential(
+            Linear(name+'_linear_3', n_hid_dim, in_dims=2),
+            hk.Dropout(dropout),
+            get_non_lin(nonlin, lkyrelu_slope),
+            get_layer_norm(name+'_norm_2', norm_type, n_hid_dim))
 
     def __call__(self, actions,
                  c_rec, f_rec, e_rec, s_rec, r_rec, m_rec,
@@ -512,7 +515,7 @@ class Critic(hk.Module):
             return ( rot @ c.transpose(1,0) ).transpose(1,0) + trasl
 
         def cross_attention(c_lig, c_rec, f_lig, f_rec):
-            shape = (self.pad_len, self.heads_num, self.n_hid_dim)
+            shape = (self.pad_len, self.heads_num, self.n_hid_dim)          # (N,H,d)
             
             c_q = jnp.reshape(self.att_score_coord_Q(c_lig), shape=shape)
             c_k = jnp.reshape(self.att_score_coord_K(c_rec), shape=shape)
@@ -522,41 +525,29 @@ class Critic(hk.Module):
             f_k = jnp.reshape(self.att_score_feat_K(f_rec), shape=shape)
             f_v = jnp.reshape(self.att_score_feat_V(f_rec), shape=shape) 
             
-            affine_c = c_q.transpose(1,0,2) @ c_k.transpose(1,2,0)
+            affine_c = c_q.transpose(1,0,2) @ c_k.transpose(1,2,0)          # (H,Nl,d)@(H,d,Nr)
             affine_f = f_q.transpose(1,0,2) @ f_k.transpose(1,2,0)
-            affine = affine_c + affine_f
-            affine = jax.nn.softmax(affine.transpose(1,2,0), axes=1)
-            affine = affine.transpose(2,0,1)
+            affine = jax.nn.softmax(affine_c + affine_f, axes=-1)           # (H,Nl,Nr)
 
-            c_out = (affine @ c_v.transpose(1,0,2)).transpose(1,0,2)
+            c_out = (affine @ c_v.transpose(1,0,2)).transpose(1,0,2)        # (H,Nl,Nr)@(H,Nr,d) = (H,Nl,d) --> (Nl,H,d)
             f_out = (affine @ f_v.transpose(1,0,2)).transpose(1,0,2)
             return self.att_score_coord(c_out) + self.att_score_feat(f_out)
 
         c_lig1 = c_lig
         c_lig2 = vmap(get_next_coord)(c_lig, actions)
-        c_rec1 = c_rec2 = c_rec
 
-        f_rec1 = f_rec2 = self.emb_layer(f_rec)
-        f_lig1 = f_lig2 = self.emb_layer(f_lig)
+        actions1 = self.actor_submodule(
+                 c_rec, f_rec, e_rec, s_rec, r_rec, m_rec,
+                 c_lig1, f_lig, e_lig, s_lig, r_lig, m_lig)
 
-        of_rec, of_lig = f_rec1, f_lig1
-        oc_rec, oc_lig1, oc_lig2 = c_rec, c_lig1, c_lig2
+        actions2 = self.actor_submodule(
+                 c_rec, f_rec, e_rec, s_rec, r_rec, m_rec,
+                 c_lig2, f_lig, e_lig, s_lig, r_lig, m_lig)
 
-        for i, layer in enumerate(self.iegmn_layers):
+        c_lig2P = vmap(get_next_coord)(c_lig1, actions1)
+        c_lig3 = vmap(get_next_coord)(c_lig2, actions2)
 
-            c_rec1, f_rec1, c_lig1, f_lig1 = layer(
-                    c_rec1, f_rec1, oc_rec, of_rec,
-                    e_rec, s_rec, r_rec, m_rec,
-                    c_lig1, f_lig1, oc_lig1, of_lig,
-                    e_lig, s_lig, r_lig, m_lig)
-
-            c_rec2, f_rec1, c_lig2, f_lig2 = layer(
-                    c_rec2, f_rec1, oc_rec, of_rec,
-                    e_rec, s_rec, r_rec, m_rec,
-                    c_lig2, f_lig2, oc_lig2, of_lig,
-                    e_lig, s_lig, r_lig, m_lig)
-
-        scores1 = vmap(cross_attention)(c_lig1, c_rec1, f_lig1, f_rec1) 
-        scores2 = vmap(cross_attention)(c_lig2, c_rec2, f_lig2, f_rec2)
-
+        scores1 = vmap(cross_attention)(c_lig2P, c_rec, f_lig, f_rec) 
+        scores2 = vmap(cross_attention)(c_lig3, c_rec, f_lig, f_rec)
+        return jnp.sum((scores1,scores2), axis=0)
          

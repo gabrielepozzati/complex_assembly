@@ -1,4 +1,5 @@
 {
+ "random_seed":42,
  "base":"/storage/complex_assembly/",
  "graph":{
 	"edge_number":10,
