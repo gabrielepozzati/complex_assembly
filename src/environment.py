@@ -21,36 +21,17 @@ class DockingEnv():
         self.init_rt = {pdb:dataset[pdb]['init_rt'] for pdb in self.list}
 
         def _extract_data(idx):
-            N = jnp.stack([dataset[pdb]['coord_N'][idx] for pdb in self.list])
-            C = jnp.stack([dataset[pdb]['coord_C'][idx] for pdb in self.list])
-            CA = jnp.stack([dataset[pdb]['coord_CA'][idx] for pdb in self.list])
+            CA = jnp.stack([dataset[pdb]['coord'][idx] for pdb in self.list])
             nodes = jnp.stack([dataset[pdb]['nodes'][idx] for pdb in self.list])
             mask = jnp.stack([dataset[pdb]['masks'][idx] for pdb in self.list])
-            if len(N.shape) == 2: 
-                N = jnp.expand_dims(N, axis=0)
-                C = jnp.expand_dims(C, axis=0)
+            if len(CA.shape) == 2: 
                 CA = jnp.expand_dims(CA, axis=0)
                 mask = jnp.expand_dims(mask, axis=0)
                 nodes = jnp.expand_dims(nodes, axis=0)
-            return mask, nodes, N, C, CA
+            return mask, nodes, CA
         
-        (self.m_rec, self.f_rec,
-         self.c_rec_N, self.c_rec_C,
-         self.c_rec_CA) = _extract_data(0)
-
-        (self.m_lig, self.f_lig,
-         self.c_lig_N, self.c_lig_C, 
-         self.c_lig_CA) = _extract_data(1)
-
-        (self.edges_rec, self.nodes_rec, 
-         self.neighs_rec) = vmap(partial(self.get_edges, self.edge_num, 0))(
-                self.c_rec_N, self.c_rec_C, self.c_rec_CA,
-                self.c_lig_N, self.c_lig_C, self.c_lig_CA)
-
-        (self.edges_lig, self.nodes_lig,
-         self.neighs_lig) = vmap(partial(self.get_edges, self.edge_num, 0))(
-                self.c_lig_N, self.c_lig_C, self.c_lig_CA,
-                self.c_rec_N, self.c_rec_C, self.c_rec_CA)
+        self.mask_rec, self.feat_rec, self.coord_rec = _extract_data(0)
+        self.mask_lig, self.feat_lig, self.coord_lig = _extract_data(1)
 
         self.padmasks_rec = jnp.where(self.m_rec!=0, 1, 0)
         self.padmasks_lig = jnp.where(self.m_lig!=0, 1, 0)
@@ -59,10 +40,18 @@ class DockingEnv():
         self.lengths_rec = jnp.sum(self.padmask_rec, axis=1)
         self.lengths_lig = jnp.sum(self.padmask_lig, axis=1)
 
-        self.dmaps = vmap(distances_from_coords)(
-                self.c_rec_CA[:,:,None,:], self.c_lig_CA[:,None,:,:])
+        self.edge_rec, self.send_rec, self.neigh_rec = \
+                vmap(partial(self.get_edges, self.edge_num, 0))(
+                        self.coord_rec, self.coord_rec, self.padmasks_rec, self.padmasks_rec)
+
+        self.edge_lig, self.send_lig, self.neigh_lig = \
+                vmap(partial(self.get_edges, self.edge_num, 0))(
+                        self.coord_lig, self.coord_lig, self.padmasks_lig, self.padmasks_lig)
+
+        self.ground_truth = vmap(distances_from_coords)(
+                self.coord_rec[:,:,None,:], self.coord_lig[:,None,:,:])
         
-        self.dmaps = vmap(lambda x, y, z: x*y[:,None]*z[None,:])(
+        self.ground_truth = vmap(lambda x, y, z: x*y[:,None]*z[None,:])(
                 self.dmaps, self.padmasks_rec, self.padmasks_lig)
 
 
@@ -72,37 +61,43 @@ class DockingEnv():
         Cloud states are set back to what is stored in dataset.
         '''
 
-        n_clouds, c_clouds, ca_clouds = [], [], []
+        ca_clouds = []
         for idx, code in enumerate(self.list):
-            if idx in idxs: n_clouds.append(dataset[code]['coord_N'][1])
-            else: n_clouds.append(self.c_lig_N[idx])
-            if idx in idxs: c_clouds.append(dataset[code]['coord_C'][1])
-            else: c_clouds.append(self.c_lig_C[idx])
             if idx in idxs: ca_clouds.append(dataset[code]['coord_CA'][1])
-            else: ca_clouds.append(self.c_lig_CA[idx])
-        self.c_lig_N = jnp.stack(n_clouds)
-        self.c_lig_C = jnp.stack(c_clouds)
-        self.c_lig_CA = jnp.stack(ca_clouds)
+            else: ca_clouds.append(self.coord_lig[idx])
+        self.coord_lig = jnp.stack(ca_clouds)
 
-        (self.edges_rec, self.nodes_rec,
-         self.neighs_rec) = vmap(partial(self.get_edges, self.edge_num, 0))(
-                self.c_rec_N, self.c_rec_C, self.c_rec_CA,
-                self.c_lig_N, self.c_lig_C, self.c_lig_CA)
-
-        (self.edges_lig, self.nodes_lig,
-         self.neighs_lig) = vmap(partial(self.get_edges, self.edge_num, 0))(
-                self.c_lig_N, self.c_lig_C, self.c_lig_CA,
-                self.c_rec_N, self.c_rec_C, self.c_rec_CA)
-
-        self.dmaps = vmap(distances_from_coords)(
-                self.c_rec_CA[:,:,None,:], self.c_lig_CA[:,None,:,:])
-        
-        self.dmaps = vmap(lambda x, y, z: x*y[:,None]*z[None,:])(
-                dmaps, self.padmask_rec, self.padmask_lig)
+#        self.dmaps = vmap(distances_from_coords)(
+#                self.coord_rec[:,:,None,:], self.coord_lig[:,None,:,:])
+#        
+#        self.dmaps = vmap(lambda x, y, z: x*y[:,None]*z[None,:])(
+#                self.dmaps, self.padmask_rec, self.padmask_lig)
 
 
-    @partial(jax.jit, static_argnums=(0,1,2))
-    def get_edges(self, edge_num, min_dist, ca_i, ca_j):
+    def get_state(self):
+
+        edge_int_rec, send_int_rec, neigh_int_rec = \
+                vmap(partial(self.get_edges, self.edge_num, 0))(
+                        self.coord_rec, self.coord_lig, self.padmasks_rec, self.padmasks_lig)
+
+        edge_int_lig, send_int_lig, neigh_int_lig = \
+                vmap(partial(self.get_edges, self.edge_num, 0))(
+                        self.coord_lig, self.coord_rec, self.padmasks_lig, self.padmasks_rec)
+
+        edge_int = vmap(lambda x, y: jnp.concatenate((x,y), axis=0))(
+                edge_int_rec, edge_int_lig)
+
+        send_int = vmap(lambda x, y: jnp.concatenate((x,y), axis=0))(
+                send_int_rec, send_int_lig+self.length_rec)
+
+        neigh_int = vmap(lambda x, y: jnp.concatenate((x,y), axis=0))(
+                neigh_int_rec+self.length_rec, neigh_int_lig)
+
+        return edge_int, send_int, neigh_int
+
+
+    @partial(jax.jit, static_argnums=(0,1))
+    def get_edges(self, edge_num, c_i, c_j, mask_i, mask_j):
         '''
         select closest edge_num neighbours to coords in set ca_i 
         between coords in set ca_j, excluding neighbours closer 
@@ -110,72 +105,48 @@ class DockingEnv():
         coords information in n_i, n_j, c_i, c_j
         '''
 
-        def _get_residue_edges(edge_num, min_dist, line):
+        def _get_residue_edges(edge_num):
       
-            def _next_lowest(min_val, array):
-                array = jnp.where(array>min_val, array, array+10e6)
+            def _next_lowest(val, array):
+                array = jnp.where(array>val, array, array+10e6)
                 next_val = jnp.min(array)
                 return next_val, jnp.argwhere(array==next_val, size=1)
       
             sorting_input = jnp.broadcast_to(line[None,:], (edge_num, line.shape[0]))
-            sorted_idxs = jnp.squeeze(jax.lax.scan(_next_lowest, min_dist, sorting_input)[1])
+            sorted_idxs = jnp.squeeze(jax.lax.scan(_next_lowest, 0, sorting_input)[1])
             sorted_line = line[sorted_idxs]
             return sorted_line, sorted_idxs
-      
-#        def _get_local_frames(n, c, ca):
-#            u_i = (n-ca)/jnp.linalg.norm((n-ca))
-#            t_i = (c-ca)/jnp.linalg.norm((c-ca))
-#            n_i = jnp.cross(u_i, t_i)/jnp.linalg.norm(jnp.cross(u_i, t_i))
-#            v_i = jnp.cross(n_i, u_i)
-#            return jnp.stack((n_i, u_i, v_i), axis=0)
-
-#        def _get_relative_features(local_i, local_j, ca_i, ca_j):
-#            q_ij = jnp.matmul(local_i, (ca_j-ca_i))
-#            k_ij = jnp.matmul(local_i, local_j[0])
-#            t_ij = jnp.matmul(local_i, local_j[1])
-#            s_ij = jnp.matmul(local_i, local_j[2])
-#            feats = jnp.concatenate((q_ij, k_ij, t_ij, s_ij), axis=0)
-#            return jnp.squeeze(feats)
       
         def _get_distance_features(dist):
             scales = 1.5 ** (jnp.indices((15,))[0]+1)
             return jnp.exp(-((dist ** 2) / scales))
-      
+
         # find edges indexes
-        dmap = distances_from_coords(ca_i[:,None,:], ca_j[None,:,:])
+        dmap = distances_from_coords(c_i[:,None,:], c_j[None,:,:])
+        dmap = dmap * mask_i[:,None] * mask_j[None,:]
+
         nodes = jnp.indices((dmap.shape[0],))[0]
         nodes = jnp.broadcast_to(nodes[:,None], (dmap.shape[0], edge_num))
-        dist, neighs = vmap(partial(_get_residue_edges, edge_num, min_dist)(dmap)
+        dist, neighs = vmap(partial(_get_residue_edges, edge_num)(dmap)
         dist, nodes, neighs = jnp.ravel(dist), jnp.ravel(nodes), jnp.ravel(neighs),
-        
-#        # compute residues local frames
-#        m_get_local_frames = vmap(_get_local_frames)
-#        all_local_i = m_get_local_frames(n_i, c_i, ca_i)
-#        all_local_j = m_get_local_frames(n_j, c_j, ca_j)
-
-#        # select edge-specific local frames
-#        local_i, cloud_i = all_local_i[nodes], ca_i[nodes]
-#        local_j, cloud_j = all_local_j[neighs], ca_j[neighs]
-        
-#        # get edge features
-#        rfeats = vmap(_get_relative_features)(local_i, local_j, cloud_i, cloud_j)
         edges = vmap(_get_distance_features)(dist)
-#        edges = jnp.concatenate((rfeats, dfeats), axis=-1)
-      
+
+        nodes = jnp.array(jnp.where(nodes<true_len, nodes, 799), dtype=jnp.uint16)
+        neighs = jnp.array(jnp.where(neighs<true_len, neighs, 799), dtype=jnp.uint16)
         return edges, nodes, neighs
 
 
     @partial(jit, static_argnums=(0,))
-    def step(self, c_rec_CA, c_lig_CA, actions):
+    def step(self, c_rec, c_lig, actions):
         '''
         apply step rotating full coordinates and recompute distance map
         '''
 
-        def _compute_keypoints(action, c_rec_CA, old_keypts):
+        def _compute_keypoints(action, c_rec, old_keypts):
             
-            def _get_distances(c_rec_CA, min_dist, max_dist, line):
+            def _get_distances(c_rec, min_dist, max_dist, line):
                 d1, d2, d3 = line[4:]
-                p1, p2, p3 = c_rec_CA[line[1:4]]
+                p1, p2, p3 = c_rec[line[1:4]]
                 d12 = jnp.linalg.norm(p1-p2)
                 max_dist = jnp.max(max_dist, d12)
 
@@ -209,8 +180,8 @@ class DockingEnv():
 
                 return jnp.array([d1l, d2l, d3l])
 
-            def _trilateration(c_rec_CA, old_keypt, line):
-                p1, p2, p3 = line[1:4]
+            def _trilateration(c_rec, old_keypt, line):
+                p1, p2, p3 = c_rec[line[1:4]]
                 r1, r2, r3 = line[4:]
 
                 e_x=(p2-p1)/np.linalg.norm(p2-p1)
@@ -232,9 +203,9 @@ class DockingEnv():
                 select = jnp.argmin(jnp.array((d1, d2)))
                 return jnp.array((l1, l2))[select]
 
-            distances = vmap(partial(_get_distances, c_rec_CA, min_dist, max_dist))(action)
+            distances = vmap(partial(_get_distances, c_rec, 6, 20))(action)
             action = jnp.concatenate((action[:,:4], distances), axis=-1)
-            trilateration = partial(_trilateration, c_rec_CA, old_keypts)
+            trilateration = partial(_trilateration, c_rec, old_keypts)
             return vmap(trilateration)(action)
         
         
@@ -264,35 +235,35 @@ class DockingEnv():
             return transformed_cloud*mask[:,None]
 
 
-        def _get_interface_graph(dmap):
-            edges12, senders12, receivers12,\
-            edges21, senders21, receivers21 = get_interface_edges(dmap, self.enum, self.size)
+#        def _ge(dmap):
+#            edges12, senders12, receivers12,\
+#            edges21, senders21, receivers21 = get_interface_edges(dmap, self.enum, self.size)
+#
+#            edges12 = encode_distances(edges12)
+#            edges21 = encode_distances(edges21)
+#
+#            all_edges = jnp.concatenate((edges12, edges21), axis=0)
+#            all_senders = jnp.concatenate((senders12, senders21), axis=0)
+#            all_receivers = jnp.concatenate((receivers12, receivers21), axis=0)
+#            return all_edges, \
+#                   jnp.array(all_senders, dtype=jnp.uint16), \
+#                   jnp.array(all_receivers, dtype=jnp.uint16)
 
-            edges12 = encode_distances(edges12)
-            edges21 = encode_distances(edges21)
 
-            all_edges = jnp.concatenate((edges12, edges21), axis=0)
-            all_senders = jnp.concatenate((senders12, senders21), axis=0)
-            all_receivers = jnp.concatenate((receivers12, receivers21), axis=0)
-            return all_edges, \
-                   jnp.array(all_senders, dtype=jnp.uint16), \
-                   jnp.array(all_receivers, dtype=jnp.uint16)
-
-
-        old_keypts = vmap(lambda x, y: x[jnp.flatten(y[:,0])])(c_lig_CA, actions)
-        new_keypts = vmap(_compute_keypoints)(action, c_rec_CA, old_keypts)
+        old_keypts = vmap(lambda x, y: x[jnp.flatten(y[:,0])])(c_lig, actions)
+        new_keypts = vmap(_compute_keypoints)(action, c_rec, old_keypts)
 
         Rs, ts = vmap(kabsch)(new_keypts, old_keypts)
 
-        c_lig_CA = vmap(_single_step)(c_lig_CA, Rs, ts, self.padmask_lig)
+        c_lig_new = vmap(_single_step)(c_lig, Rs, ts, self.padmask_lig)
 
         dmaps = vmap(distances_from_coords)(
-                self.c_rec_CA[:,:,None,:], c_lig_CA_new[:,None,:,:])
+                self.c_rec[:,:,None,:], c_lig_new[:,None,:,:])
         
         dmaps = vmap(lambda x, y, z: x*y[:,None]*z[None,:])(
                 dmaps_new, self.padmask_rec, self.padmask_lig)
         
-        return dmaps, c_lig_N, c_lig_C, c_lig_CA
+        return dmaps, c_lig_new
 
     @partial(jit, static_argnums=(0,))
     def get_rewards(self, dmaps):

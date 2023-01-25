@@ -38,8 +38,7 @@ sasa = ShrakeRupley()
 def format_data(code, str1, str2, key, negative, enum=10, maxlen=400):
     structures = [str1, str2]
 
-    masks_pair, nodes_pair = [], []
-    CA_pair, C_pair, N_pair = [], [], []
+    masks_pair, nodes_pair, coord_pair = [], [], []
     for idx, struc in enumerate(structures):    
         try:
             sasa.compute(struc, level='R')
@@ -47,10 +46,10 @@ def format_data(code, str1, str2, key, negative, enum=10, maxlen=400):
         except:
             print (f'Failed SASA computation in {code}')
             return [code, None]
+
         struc = unfold_entities(struc, 'R')
         
-        masks, nodes = [], [], 
-        coordN, coordC, coordCA = [], [], []
+        masks, nodes, coord = [], [], []
         for residue in struc: 
             rid = residue.get_resname()
             if rid not in standard_residues_three: continue
@@ -67,19 +66,15 @@ def format_data(code, str1, str2, key, negative, enum=10, maxlen=400):
             else: nodes.append(residue_1hot[rid]+[0,1])
 
             # get CA coordinates to compute local frames and edges
-            coordCA.append(jnp.array(residue['CA'].get_coord()))
-            coordC.append(jnp.array(residue['C'].get_coord()))
-            coordN.append(jnp.array(residue['N'].get_coord()))
+            coord.append(jnp.array(residue['CA'].get_coord()))
 
         # store point cloud and surface mask
         masks_pair.append(jnp.array(masks))
         nodes_pair.append(jnp.array(nodes))
-        CA_pair.append(jnp.array(coordCA))
-        C_pair.append(jnp.array(coordC))
-        N_pair.append(jnp.array(coordN))
+        coord_pair.append(jnp.array(coord))
 
-    if len(CA_pair[0]) == 0 or len(CA_pair[1]) == 0 \
-    or len(CA_pair[0]) >= maxlen or len(CA_pair[1]) >= maxlen: 
+    if len(coord_pair[0]) == 0 or len(coord_pair[1]) == 0 \
+    or len(coord_pair[0]) >= maxlen or len(coord_pair[1]) >= maxlen: 
         print (f'One empty/too long struct. in {code}')
         return [code, None]
 
@@ -109,15 +104,6 @@ def format_data(code, str1, str2, key, negative, enum=10, maxlen=400):
 #        print (f'Existing interface in negative example: {code}')
 #        return [code, None]
 
-    # randomly rotate and space input clouds
-#    key1, key2 = jax.random.split(key)
-    #cloud1, cloud2, rt1, rt2 = initialize_clouds(cloud1, cloud2, cmap1, cmap2, key1)
-    rt1 = rt2 = [jnp.array([0.,0.,0.]), jnp.array([1.,0.,0.,0.])]
-#    mask1, mask2 = masks_pair
-#
-#    # compute, pad and encode initial inter-chain edges
-#    icmap = distances_from_cloud(cloud1[:,None,:], cloud2[None,:,:])
-
     # pad clouds and masks
     padlen1 = maxlen-len(nodes_pair[0])
     padlen2 = maxlen-len(nodes_pair[1])
@@ -125,29 +111,18 @@ def format_data(code, str1, str2, key, negative, enum=10, maxlen=400):
             jnp.concatenate((masks_pair[0], jnp.zeros((padlen1,))), axis=0),
             jnp.concatenate((masks_pair[1], jnp.zeros((padlen2,))), axis=0)]
 
-    N_pair = [
-            jnp.concatenate((N_pair[0], jnp.zeros((padlen1, 3))), axis=0),
-            jnp.concatenate((N_pair[1], jnp.zeros((padlen2, 3))), axis=0)]
-
-    C_pair = [
-            jnp.concatenate((C_pair[0], jnp.zeros((padlen1, 3))), axis=0),
-            jnp.concatenate((C_pair[1], jnp.zeros((padlen2, 3))), axis=0)]
-
-    CA_pair = [
-            jnp.concatenate((CA_pair[0], jnp.zeros((padlen1, 3))), axis=0),
-            jnp.concatenate((CA_pair[1], jnp.zeros((padlen2, 3))), axis=0)]
+    coord_pair = [
+            jnp.concatenate((coord_pair[0], jnp.zeros((padlen1, 3))), axis=0),
+            jnp.concatenate((coord_pair[1], jnp.zeros((padlen2, 3))), axis=0)]
 
     nodes_pair = [
             jnp.concatenate((nodes_pair[0], jnp.zeros((padlen1, 22))), axis=0),
             jnp.concatenate((nodes_pair[1], jnp.zeros((padlen2, 22))), axis=0)]
 
     print (f'Finished {code}')
-    return [code, {'coord_N':N_pair, 
-                   'coord_C':C_pair,
-                   'coord_CA':CA_pair,
+    return [code, {'coord':coord_pair,
                    'masks':masks_pair,
-                   'nodes':nodes_pair,
-                   'init_rt':[rt1, rt2]}]
+                   'nodes':nodes_pair}]
     
 
 def plot_dataset_stats(dataset, subset_paths):

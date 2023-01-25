@@ -71,15 +71,16 @@ def parse_args():
 def load_dataset(path, size=None, skip=0):
     count = 0
     dataset = {}
+    print ('Set size:', size)
     for idx, path in enumerate(glob.glob(path+'/*')):
         if idx < skip: continue
-        print (path)
         code = path.split('/')[-1].rstrip('.pkl')
         f = open(path, 'br')
         data = pkl.load(f)
+        print (code)
 
         # restore device array type
-        for lbl in ['coord_N', 'coord_C', 'coord_CA', 'nodes', 'masks']:
+        for lbl in ['coord', 'nodes', 'masks']:
             data[lbl] = (jnp.array(data[lbl][0]),jnp.array(data[lbl][1]))
 
         dataset[code] = data
@@ -92,9 +93,6 @@ class TrainState(NamedTuple):
     params: hk.Params
     target_params: hk.Params
     opt_state: optax.OptState
-
-def adjust_action(action):
-    return jnp.concatenate((quat_from_pred(action[:,:3]), action[:,3:]), axis=-1)
 
 def save_to_model(out_struc, ref_model, quat, tr, init=False):
     atoms = unfold_entities(ref_model, 'A')
@@ -126,8 +124,8 @@ if __name__ == "__main__":
     with open(args.path+'/src/config.json') as j:
         config = json.load(j)
 
-    dataset, code = load_dataset(args.path+'data/dataset_features/', size=1)
-    test, test_code = load_dataset(args.path+'data/dataset_features/', size=1)
+    dataset, code = load_dataset(args.path+'data/dataset_features/', size=2)
+    test, test_code = load_dataset(args.path+'data/dataset_features/', size=1, skip=2)
 
     io = PDBIO()
     pdbp = PDBParser(QUIET=True)
@@ -170,21 +168,29 @@ if __name__ == "__main__":
     r_buffer = ReplayBuffer(buff_key, args.buffer_size,
                             envs.list, 10, 400, cpus[0])
 
-    def actor_fw(c_rec, f_rec, e_rec, s_rec, r_rec, m_rec,
-                 c_lig, f_lig, e_lig, s_lig, r_lig, m_lig):
+    def actor_fw(f_rec, f_lig, m_rec, m_lig,
+                 e_rec, s_rec, n_rec,
+                 e_lig, s_lig, n_lig,
+                 e_int, s_int, n_int):
 
         actor = Actor('actor', 5, True, config)
 
-        return actor(c_rec, f_rec, e_rec, s_rec, r_rec, m_rec,
-                     c_lig, f_lig, e_lig, s_lig, r_lig, m_lig)
+        return actor(f_rec, f_lig, m_rec, m_lig,
+                     e_rec, s_rec, r_rec,
+                     e_lig, s_lig, r_lig,
+                     e_int, s_int, n_int)
 
-    def critic_fw(c_rec, f_rec, e_rec, s_rec, r_rec, m_rec,
-                  c_lig, f_lig, e_lig, s_lig, r_lig, m_lig, action):
+    def critic_fw(f_rec, f_lig, m_rec, m_lig,
+                  e_rec, s_rec, n_rec,
+                  e_lig, s_lig, n_lig,
+                  e_int, s_int, n_int, action):
 
         critic = Critic('critic', 5, True, config)
 
-        return critic(c_rec, f_rec, e_rec, s_rec, r_rec, m_rec,
-                      c_lig, f_lig, e_lig, s_lig, r_lig, m_lig, action)
+        return critic(f_rec, f_lig, m_rec, m_lig,
+                      e_rec, s_rec, n_rec,
+                      e_lig, s_lig, n_lig,
+                      e_int, s_int, n_int, action)
 
     # actor/critic models setup
     actor = hk.transform(actor_fw)
@@ -194,25 +200,25 @@ if __name__ == "__main__":
     
     # actor parameters initialization
     a_params = actor.init(act_key, 
-            envs.c_rec_CA[0], envs.f_rec[0], envs.edges_rec[0],
-            envs.nodes_rec[0], envs.neighs_rec[0], envs.l_rec[0],
-            envs.c_lig_CA[0], envs.f_lig[0], envs.edges_lig[0],
-            envs.nodes_lig[0], envs.neighs_lig[0], envs.l_lig[0])
+            envs.f_rec[0], envs.f_lig[0], envs.m_rec[0], envs.m_lig[0],
+            envs.e_rec[0], envs.s_rec[0], envs.n_rec[0],
+            envs.e_lig[0], envs.s_lig[0], envs.n_lig[0],
+            envs.e_int[0], envs.s_int[0], envs.n_int[0])
 
     # critic parameters initialization
     action = a_apply(a_params, None,
-            envs.c_rec_CA[0], envs.f_rec[0], envs.edges_rec[0],
-            envs.nodes_rec[0], envs.neighs_rec[0], envs.l_rec[0],
-            envs.c_lig_CA[0], envs.f_lig[0], envs.edges_lig[0],
-            envs.nodes_lig[0], envs.neighs_lig[0], envs.l_lig[0])
+            envs.f_rec[0], envs.f_lig[0], envs.m_rec[0], envs.m_lig[0],
+            envs.e_rec[0], envs.s_rec[0], envs.n_rec[0],
+            envs.e_lig[0], envs.s_lig[0], envs.n_lig[0],
+            envs.e_int[0], envs.s_int[0], envs.n_int[0])
     
     action = adjust_action(action[None,:])
 
     c_params = critic.init(crit_key,
-            envs.c_rec_CA[0], envs.f_rec[0], envs.e_rec[0], 
-            envs.s_rec[0], envs.r_rec[0], envs.m_rec[0],
-            envs.c_lig_CA[0], envs.f_lig[0], envs.e_lig[0], 
-            envs.s_lig[0], envs.r_lig[0], envs.m_rec[0],
+            envs.f_rec[0], envs.f_lig[0], envs.m_rec[0], envs.m_lig[0],
+            envs.e_rec[0], envs.s_rec[0], envs.n_rec[0],
+            envs.e_lig[0], envs.s_lig[0], envs.n_lig[0],
+            envs.e_int[0], envs.s_int[0], envs.n_int[0],
             action)
 
     # duplicate and group actor/critic params, init optimizer
@@ -235,34 +241,50 @@ if __name__ == "__main__":
     def update_critic(actor_state, critic_state, batch, idxs):
         s = time.time()
 
+        #get batch sizes
+        bs = (batch['next_edges'].shape[0],)
+        fs = envs.feat_rec.shape[-2:]
+        ms = envs.mask_rec.shape[-1:]
+        es = envs.edge_rec.shape[-2:]
+        ss = envs.send_rec.shape[-1:]
+
+        feat_rec_batch = jnp.broadcast_to(envs.feat_rec[idxs][None,:,:], shape=bs+fs)
+        feat_lig_batch = jnp.broadcast_to(envs.feat_lig[idxs][None,:,:], shape=bs+fs)
+        mask_rec_batch = jnp.broadcast_to(envs.mask_rec[idxs][None,:], shape=bs+ms)
+        mask_lig_batch = jnp.broadcast_to(envs.mask_lig[idxs][None,:], shape=bs+ms)
+        edge_rec_batch = jnp.broadcast_to(envs.edge_rec[idxs][None,:,:], shape=bs+es)
+        send_rec_batch = jnp.broadcast_to(envs.send_rec[idxs][None,:], shape=bs+ss)
+        neigh_rec_batch = jnp.broadcast_to(envs.neigh_rec[idxs][None,:], shape=bs+ss)
+        edge_lig_batch = jnp.broadcast_to(envs.edge_lig[idxs][None,:,:], shape=bs+es)
+        send_lig_batch = jnp.broadcast_to(envs.send_lig[idxs][None,:], shape=bs+ss)
+        neigh_lig_batch = jnp.broadcast_to(envs.neigh_lig[idxs][None,:], shape=bs+ss)
+
         # map all protein pairs to corresponding batch to compute next-step Q
-        a_apply_params = partial(a_apply, actor_state.target_params, None)
-        a_apply_dataset = partial(vmap(a_apply_params),
-                envs.e_rec[idxs], envs.s_rec[idxs], envs.r_rec[idxs], envs.n_rec[idxs],
-                envs.e_lig[idxs], envs.s_lig[idxs], envs.r_lig[idxs])
+        a_apply = partial(a_apply, actor_state.target_params, None)
+        actions = vmap(a_apply)(
+                feat_rec_batch, feat_lig_batch, mask_rec_batch, mask_lig_batch,
+                edge_rec_batch, send_rec_batch, neigh_rec_batch,
+                edge_lig_batch, send_lig_batch, neigh_lig_batch,
+                batch['next_edges'], batch['next_senders'], batch['next_receivers'])
 
-        actions = vmap(a_apply_dataset)(batch['next_nodes'], batch['next_edges'],
-                batch['next_senders'], batch['next_receivers'])
-
-        actions = vmap(adjust_action)(actions)
-
-        c_apply_params = partial(c_apply, critic_state.target_params, None)
-        c_apply_dataset = partial(vmap(c_apply_params),
-                envs.e_rec[idxs], envs.s_rec[idxs], envs.r_rec[idxs], envs.n_rec[idxs],
-                envs.e_lig[idxs], envs.s_lig[idxs], envs.r_lig[idxs])
-        next_q = vmap(c_apply_dataset)(batch['next_nodes'], batch['next_edges'], 
-                batch['next_senders'], batch['next_receivers'], actions)
+        c_apply = partial(c_apply, critic_state.target_params, None)
+        next_q = vmap(c_apply)(
+                feat_rec_batch, feat_lig_batch, mask_rec_batch, mask_lig_batch,
+                edge_rec_batch, send_rec_batch, neigh_rec_batch,
+                edge_lig_batch, send_lig_batch, neigh_lig_batch,
+                batch['next_edges'], batch['next_senders'], batch['next_receivers'], actions)
 
         # compute critic loss targets across batch
         y = batch['rewards'] + (args.gamma*next_q)
 
         def crit_loss_fn(params):
-            c_apply_params = partial(c_apply, params, None)
-            c_apply_dataset = partial(vmap(c_apply_params),
-                    envs.e_rec[idxs], envs.s_rec[idxs], envs.r_rec[idxs], envs.n_rec[idxs],
-                    envs.e_lig[idxs], envs.s_lig[idxs], envs.r_lig[idxs])
-            q = vmap(c_apply_dataset)(batch['prev_nodes'], batch['prev_edges'], 
-                    batch['prev_senders'], batch['prev_receivers'], batch['actions'])
+            c_apply = partial(c_apply, params, None)
+            q = vmap(c_apply)(
+                    feat_rec_batch, feat_lig_batch, mask_rec_batch, mask_lig_batch,
+                    edge_rec_batch, send_rec_batch, neigh_rec_batch,
+                    edge_lig_batch, send_lig_batch, neigh_lig_batch,
+                    batch['prev_edges'], batch['prev_senders'], 
+                    batch['prev_receivers'], batch['actions'])
 
             return jnp.mean((y - q)**2)
 
@@ -279,22 +301,38 @@ if __name__ == "__main__":
     @jax.jit
     def update_actor(actor_state, critic_state, batch, idxs):
 
+        #get batch sizes
+        bs = (batch['next_edges'].shape[0],)
+        fs = envs.feat_rec.shape[-2:]
+        ms = envs.mask_rec.shape[-1:]
+        es = envs.edge_rec.shape[-2:]
+        ss = envs.send_rec.shape[-1:]
+
+        feat_rec_batch = jnp.broadcast_to(envs.feat_rec[idxs][None,:,:], shape=bs+fs)
+        feat_lig_batch = jnp.broadcast_to(envs.feat_lig[idxs][None,:,:], shape=bs+fs)
+        mask_rec_batch = jnp.broadcast_to(envs.mask_rec[idxs][None,:], shape=bs+ms)
+        mask_lig_batch = jnp.broadcast_to(envs.mask_lig[idxs][None,:], shape=bs+ms)
+        edge_rec_batch = jnp.broadcast_to(envs.edge_rec[idxs][None,:,:], shape=bs+es)
+        send_rec_batch = jnp.broadcast_to(envs.send_rec[idxs][None,:], shape=bs+ss)
+        neigh_rec_batch = jnp.broadcast_to(envs.neigh_rec[idxs][None,:], shape=bs+ss)
+        edge_lig_batch = jnp.broadcast_to(envs.edge_lig[idxs][None,:,:], shape=bs+es)
+        send_lig_batch = jnp.broadcast_to(envs.send_lig[idxs][None,:], shape=bs+ss)
+        neigh_lig_batch = jnp.broadcast_to(envs.neigh_lig[idxs][None,:], shape=bs+ss)
+
         def actor_loss_fn(params):
-            a_apply_params = partial(a_apply, params, None)
-            a_apply_dataset = partial(vmap(a_apply_params),
-                envs.e_rec[idxs], envs.s_rec[idxs], envs.r_rec[idxs], envs.n_rec[idxs],
-                envs.e_lig[idxs], envs.s_lig[idxs], envs.r_lig[idxs])
-            actions = vmap(a_apply_dataset)(batch['prev_nodes'], batch['prev_edges'], 
-                    batch['prev_senders'], batch['prev_receivers'])
+            a_apply = partial(a_apply, params, None)
+            actions = vmap(a_apply_params)(
+                    feat_rec_batch, feat_lig_batch, mask_rec_batch, mask_lig_batch,
+                    edge_rec_batch, send_rec_batch, neigh_rec_batch,
+                    edge_lig_batch, send_lig_batch, neigh_lig_batch,
+                    batch['prev_edges'], batch['prev_senders'], batch['prev_receivers'])
 
-            actions = vmap(adjust_action)(actions)
-
-            c_apply_params = partial(c_apply, critic_state.params, None)
-            c_apply_dataset = partial(vmap(c_apply_params),
-                    envs.e_rec[idxs], envs.s_rec[idxs], envs.r_rec[idxs], envs.n_rec[idxs],
-                    envs.e_lig[idxs], envs.s_lig[idxs], envs.r_lig[idxs])
-            q = vmap(c_apply_dataset)(batch['prev_nodes'], batch['prev_edges'], 
-                    batch['prev_senders'], batch['prev_receivers'], actions)
+            c_apply = partial(c_apply, critic_state.params, None)
+            q = vmap(c_apply)(
+                    feat_rec_batch, feat_lig_batch, mask_rec_batch, mask_lig_batch,
+                    edge_rec_batch, send_rec_batch, neigh_rec_batch,
+                    edge_lig_batch, send_lig_batch, neigh_lig_batch,
+                    batch['prev_edges'], batch['prev_senders'], batch['prev_receivers'], actions)
 
             return jnp.mean(-q)
 
@@ -343,29 +381,22 @@ if __name__ == "__main__":
         keys2 = jnp.stack(jrn.split(key, envs.number))
         keys3 = jnp.stack(jrn.split(key, envs.number))
 
-        # run actor
-        edges, nodes, neighs = envs.get_edges(
-                c_lig_N, c_lig_N, c_lig_C, c_lig_C, c_lig_CA, c_lig_CA, 10)
+        # get state
+        envs.edge_int, envs.send_int, envs.neigh_int = envs.get_state()
 
         actions = vmap(partial(a_apply, a_params, None))(
-                envs.c_rec, envs.f_rec, envs.e_rec, envs.s_rec, envs.r_rec, envs.m_rec,
-                envs.c_lig, envs.f_lig, envs.e_lig, envs.s_lig, envs.r_lig, envs.m_lig)
+                envs.feat_rec, envs.feat_lig, envs.mask_rec, envs.mask_lig, 
+                envs.edge_rec, envs.send_rec, envs.neigh_rec,
+                envs.edge_lig, envs.send_lig, envs.neigh_lig,
+                envs.edge_int, envs.send_int, envs.neigh_int,)
 
         # add noise to action
-        noiseless = actions
-        actions = vmap(lambda x, y, z: jnp.concatenate(
-                (jnp.squeeze(x[:9] + jrn.normal(y, shape=(9,))*args.rot_noise),
-                 jnp.squeeze(x[-3:] + jrn.normal(z, shape=(3,))*args.tr_noise)),
-                axis=-1))(actions, keys1, keys2)
 
-        #actions = jnp.concatenate((quat_from_pred(actions[:,:3]), actions[:,3:]), axis=-1)
+        # apply action
+        dmaps, coord_lig = envs.step(envs.coord_rec, envs.coord_lig, actions)
         
-        # get new state after executing action
-        dmaps, c_lig_N, c_lig_C, c_lig_CA = envs.step(
-                envs.c_lig_N, envs.c_lig_C, envs.c_lig_CA, actions)
-        
-        edges, nodes, neighs = envs.get_edges(
-                c_lig_N, c_lig_N, c_lig_C, c_lig_C, c_lig_CA, c_lig_CA, 10)
+        # get new state
+        envs.edge_int, envs.send_int, envs.neigh_int = envs.get_state()
 
         # get reward for last action
         rewards = envs.get_rewards(dmaps)
@@ -374,68 +405,54 @@ if __name__ == "__main__":
         # store experiences in replay buffer
         r_buffer.buffer, r_buffer.actual_size = r_buffer.add_to_replay(
             r_buffer.buffer,
-            {'prev_coord':envs.c_lig_CA, 'next_coord':c_lig_CA,
-             #'prev_edges':envs.e_lig, 'next_edges':e_lig_next,
-             #'prev_senders':envs.s_lig, 'next_senders':s_lig_next,
-             #'prev_receivers':envs.r_lig, 'next_receivers':r_lig_next,
+            {'prev_edges':envs.edge_lig, 'next_edges':edge_lig,
+             'prev_senders':envs.send_lig, 'next_senders':send_lig,
+             'prev_receivers':envs.neigh_lig, 'next_receivers':neigh_lig,
              'actions':actions, 'rewards':rewards})
 
         # update state for next iteration
-        envs.c_lig = c_lig_next
-        envs.e_int = e_int_next
-        envs.s_int = s_int_next
-        envs.r_int = r_int_next
-        envs.n_lig = n_lig_next
+        envs.coord_lig = coord_lig
+        envs.edge_int = edge_int
+        envs.send_int = send_int
+        envs.neigh_int = neigh_int
 
         # check reset conditions
         chains_distances = jnp.where(dmaps==0, 1e9, dmaps)
         clashes = jnp.sum(jnp.where(chains_distances<4, 1, 0))
-
-        if (global_step+1)%args.episode_steps == 0 \
-        or (global_step+1) == args.buffer_size \
-        or jnp.all(chains_distances>12) \
-        or clashes > 50:
+        if jnp.all(chains_distances>12) or clashes > 20:
             reset_idxs = jnp.ravel(jnp.indices((envs.number,)))
             envs.reset(dataset, reset_idxs)
-            # if check hard limit for chain distances
-            #chains_distances = jnp.min(jnp.where(dmaps==0, 1e9, dmaps), axis=0)
-            #reset_idxs = jnp.ravel(jnp.argwhere(chains_distances>16))
-            # update single pairs state for next iteration
-            #if reset_idxs.shape[0] > 0: envs.reset(dataset, reset_idxs)
+            print ('Reset!')
 
         # network updates
         if global_step+1 > args.buffer_size \
         and (global_step+1) % args.policy_frequency == 0:
             
-            # sample batch from replay buffer
             gpus = jax.devices('gpu')
-            
             key, pkey = jrn.split(key, 2)
-            batch_idx_order = jrn.choice(
-                    pkey, envs.number, shape=(envs.number,), replace=False)
-            batch_idx_order = list([idx for idx in batch_idx_order])
 
-            while len(batch_idx_order) >= args.batch_pair_num:
-                prot_idxs = ()
-                for _ in range(args.batch_pair_num):
-                    prot_idxs += (int(batch_idx_order.pop(0)),)
+            # select a number of protein pairs 
+            batch_pair_idx = jrn.choice(
+                    pkey, envs.number, shape=(args.batch_pair_num,), replace=False)
 
-                prot_batch_list = [envs.list[idx] for idx in prot_idxs]
-                prot_buffers = [r_buffer.buffer[code] for code in prot_batch_list]
-
-                batch, r_buffer.key = r_buffer.sample_from_replay(
-                        args.batch_size, prot_buffers, r_buffer.key)
+            # get corresponding codes
+            batch_pair_codes = [envs.list[idx] for idx in batch_pair_idx]
                 
-                batch = jax.device_put(batch, device=gpus[0])
-                prot_idxs = jnp.array(prot_idxs)
+            # group buffers for each pair code
+            prot_buffers = [r_buffer.buffer[code] for code in batch_pair_codes]
 
-                # update critic parameters
-                critic_state, crit_loss = update_critic(
-                        actor_state, critic_state, batch, prot_idxs)
+            # extract batch
+            batch, r_buffer.key = r_buffer.sample_from_replay(
+                    args.batch_size, prot_buffers, r_buffer.key)    
+            batch = jax.device_put(batch, device=gpus[0])
 
-                # update actor and target nets parameters
-                actor_state, critic_state, actor_loss_value = update_actor(
-                        actor_state, critic_state, batch, prot_idxs)
+            # update critic parameters
+            critic_state, crit_loss = update_critic(
+                    actor_state, critic_state, batch, batch_pair_idx)
+
+            # update actor and target nets parameters
+            actor_state, critic_state, actor_loss_value = update_actor(
+                    actor_state, critic_state, batch, batch_pair_idx)
 
             # store rewards
             mean_reward = jnp.mean(jnp.array(rewards_episode))

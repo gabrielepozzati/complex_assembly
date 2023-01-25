@@ -17,12 +17,7 @@ class ReplayBuffer():
 
         shape_idx = (self.max_size, 1, pad*enum*2)
         shape_edges = (self.max_size, 1, pad*enum*2, 2)
-        shape_cloud = (self.max_size, 1, pad, 43)
         self.data = {
-                'prev_nodes':jax.device_put(
-                    jnp.empty(shape_cloud, dtype=jnp.float32),
-                    device=device),
-
                 'prev_edges':jax.device_put(
                     jnp.empty(shape_edges, dtype=jnp.float32), 
                     device=device),
@@ -33,10 +28,6 @@ class ReplayBuffer():
 
                 'prev_receivers':jax.device_put(
                     jnp.empty(shape_idx, dtype=jnp.uint16), 
-                    device=device),
-
-                'next_nodes':jax.device_put(
-                    jnp.empty(shape_cloud, dtype=jnp.float32),
                     device=device),
 
                 'next_edges':jax.device_put(
