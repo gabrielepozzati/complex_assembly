@@ -53,7 +53,6 @@ class ReplayBuffer():
         self.buffer = {code:self.data for code in plist}
 
         acc = (shape_idx[0]*shape_idx[1]*self.pair_number*2*4)
-        acc += (shape_cloud[0]*shape_cloud[1]*self.pair_number*3*4)
         acc += (shape_edges[0]*shape_edges[1]*shape_edges[2]*self.pair_number*4*2)
         acc += (self.max_size*self.pair_number*8*4) + (self.max_size*self.pair_number*4)
         print (f'Buffer size {float(acc)/1e9} GB')

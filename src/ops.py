@@ -1,15 +1,40 @@
 import os
 import sys
 import jax
+import glob
 import jraph
+import pickle as pkl
 from functools import partial
 import jax.numpy as jnp
 import pdb as debug
 from jax import vmap
 
+def load_dataset(path, size=None, skip=0):
+    count = 0
+    dataset = {}
+    print ('Set size:', size)
+    for idx, path in enumerate(glob.glob(path+'/*')):
+        if idx < skip: continue
+        code = path.split('/')[-1].rstrip('.pkl')
+        f = open(path, 'br')
+        data = pkl.load(f)
+        print (code)
+
+        # restore device array type
+        for lbl in ['coord', 'nodes', 'masks']:
+            data[lbl] = (jnp.array(data[lbl][0]),jnp.array(data[lbl][1]))
+
+        dataset[code] = data
+        count += 1
+        if count == size: break
+
+    return dataset, code
+
+
 @jax.jit
 def distances_from_coords(coords1, coords2):
     return jnp.sqrt(jnp.sum((coords1-coords2)**2, axis=-1))
+
 
 #@partial(jax.jit, static_argnums=5)
 def get_edges(cmap, local1, local2, cloud1, cloud2, enum):
@@ -52,30 +77,6 @@ def get_edges(cmap, local1, local2, cloud1, cloud2, enum):
 
   return (edges, nodes_i, neighs_j)
 
-### TODO move in environment?
-def initialize_clouds(cloud1, cloud2, cmap1, cmap2, key):
-    
-    def cloud_center(cloud):
-        return jnp.sum(cloud, axis=0)/cloud.shape[0]
-
-    def init_cloud(cloud, cm, key):
-        cloud = cloud-cm[None,:]
-        quat = quat_from_pred(jax.random.normal(key, (3,)))
-        cloud = quat_rotation(cloud, quat)
-        tgroup = [cm, quat]
-        return cloud, tgroup
-
-    cm1 = cloud_center(cloud1)
-    cm2 = cloud_center(cloud2)
-
-    max_c1 = jnp.max(cmap1)
-    max_c2 = jnp.max(cmap2)
-    cm2 -= jnp.array([max_c1+max_c2, 0., 0.])
-
-    key1, key2 = jax.random.split(key, 2)
-    cloud1, tgroup1 = init_cloud(cloud1, cm1, key1)
-    cloud2, tgroup2 = init_cloud(cloud2, cm2, key2)
-    return cloud1, cloud2, tgroup1, tgroup2
 
 ### TODO WRITE AS A CLASS
 def write_mmcif(chain_ids, transforms, in_path, out_path) -> None:
@@ -118,3 +119,27 @@ def write_mmcif(chain_ids, transforms, in_path, out_path) -> None:
 
     io.set_structure(out_struc)
     io.save(out_path)
+
+
+def save_to_model(out_struc, ref_model, quat, tr, init=False):
+    atoms = unfold_entities(ref_model, 'A')
+    cloud = jnp.array([atom.get_coord() for atom in atoms])
+
+    if init:
+        cloud = quat_rotation(cloud-tr, quat)
+    else:
+        cloud_cm = jnp.mean(cloud, axis=0)
+        cloud = quat_rotation(cloud-cloud_cm, quat)+cloud_cm
+        cloud += tr
+
+    model_num = len(unfold_entities(out_struc, 'M'))
+    model = copy.deepcopy(ref_model)
+    model.detach_parent()
+    model.id = model_num+1
+    model.set_parent(out_struc)
+    out_struc.add(model)
+
+    atoms = unfold_entities(model, 'A')
+    for xyz, atom in zip(cloud, atoms): atom.set_coord(xyz)
+
+    return out_struc

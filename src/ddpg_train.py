@@ -30,9 +30,12 @@ from ops import *
 from Bio.PDB import PDBIO, PDBParser
 from Bio.PDB.Structure import Structure
 
+class TrainState(NamedTuple):
+    params: hk.Params
+    target_params: hk.Params
+    opt_state: optax.OptState
 
-
-def parse_args():
+if __name__ == "__main__":    
     parser = argparse.ArgumentParser()
     parser.add_argument("--path", type=str, 
         default='/home/pozzati/complex_assembly/',
@@ -66,61 +69,8 @@ def parse_args():
     parser.add_argument("--noise_clip", type=float, default=0.5,
         help="noise clip parameter of the Target Policy Smoothing Regularization")
     args = parser.parse_args()
-    return args
-
-def load_dataset(path, size=None, skip=0):
-    count = 0
-    dataset = {}
-    print ('Set size:', size)
-    for idx, path in enumerate(glob.glob(path+'/*')):
-        if idx < skip: continue
-        code = path.split('/')[-1].rstrip('.pkl')
-        f = open(path, 'br')
-        data = pkl.load(f)
-        print (code)
-
-        # restore device array type
-        for lbl in ['coord', 'nodes', 'masks']:
-            data[lbl] = (jnp.array(data[lbl][0]),jnp.array(data[lbl][1]))
-
-        dataset[code] = data
-        count += 1
-        if count == size: break
-
-    return dataset, code
-
-class TrainState(NamedTuple):
-    params: hk.Params
-    target_params: hk.Params
-    opt_state: optax.OptState
-
-def save_to_model(out_struc, ref_model, quat, tr, init=False):
-    atoms = unfold_entities(ref_model, 'A')
-    cloud = jnp.array([atom.get_coord() for atom in atoms])
-
-    if init:
-        cloud = quat_rotation(cloud-tr, quat)
-    else:
-        cloud_cm = jnp.mean(cloud, axis=0)
-        cloud = quat_rotation(cloud-cloud_cm, quat)+cloud_cm
-        cloud += tr
-
-    model_num = len(unfold_entities(out_struc, 'M'))
-    model = copy.deepcopy(ref_model)
-    model.detach_parent()
-    model.id = model_num+1
-    model.set_parent(out_struc)
-    out_struc.add(model)
-
-    atoms = unfold_entities(model, 'A')
-    for xyz, atom in zip(cloud, atoms): atom.set_coord(xyz)
     
-    return out_struc
-
-if __name__ == "__main__":
     s = time.time()
-    args = parse_args()
-
     with open(args.path+'/src/config.json') as j:
         config = json.load(j)
 
@@ -158,7 +108,7 @@ if __name__ == "__main__":
 
     # environment setup
     envs = DockingEnv(dataset, 10, 400, env_key)
-    envs_test = DockingEnv(test, 10, 400, env_key)
+    tenvs = DockingEnv(test, 10, 400, env_key)
     #print (envs_test.list)
     #print (envs_test.e_rec.shape, envs_test.s_rec.shape, envs_test.r_rec.shape, envs_test.n_rec.shape,
     #       envs_test.e_lig.shape, envs_test.s_lig.shape, envs_test.r_lig.shape, envs_test.n_lig.shape,
@@ -192,48 +142,48 @@ if __name__ == "__main__":
                       e_lig, s_lig, n_lig,
                       e_int, s_int, n_int, action)
 
-    # actor/critic models setup
-    actor = hk.transform(actor_fw)
-    critic = hk.transform(critic_fw)
-    a_apply = jax.jit(actor.apply)
-    c_apply = jax.jit(critic.apply)
-    
-    # actor parameters initialization
-    a_params = actor.init(act_key, 
-            envs.f_rec[0], envs.f_lig[0], envs.m_rec[0], envs.m_lig[0],
-            envs.e_rec[0], envs.s_rec[0], envs.n_rec[0],
-            envs.e_lig[0], envs.s_lig[0], envs.n_lig[0],
-            envs.e_int[0], envs.s_int[0], envs.n_int[0])
-
-    # critic parameters initialization
-    action = a_apply(a_params, None,
-            envs.f_rec[0], envs.f_lig[0], envs.m_rec[0], envs.m_lig[0],
-            envs.e_rec[0], envs.s_rec[0], envs.n_rec[0],
-            envs.e_lig[0], envs.s_lig[0], envs.n_lig[0],
-            envs.e_int[0], envs.s_int[0], envs.n_int[0])
-    
-    action = adjust_action(action[None,:])
-
-    c_params = critic.init(crit_key,
-            envs.f_rec[0], envs.f_lig[0], envs.m_rec[0], envs.m_lig[0],
-            envs.e_rec[0], envs.s_rec[0], envs.n_rec[0],
-            envs.e_lig[0], envs.s_lig[0], envs.n_lig[0],
-            envs.e_int[0], envs.s_int[0], envs.n_int[0],
-            action)
-
-    # duplicate and group actor/critic params, init optimizer
-    a_optimiser = optax.adam(learning_rate=args.learning_rate)
-    c_optimiser = optax.adam(learning_rate=args.learning_rate*10)
-
-    actor_state = TrainState(
-        params=a_params,
-        target_params=a_params,
-        opt_state=a_optimiser.init(a_params))
-
-    critic_state = TrainState(
-        params=c_params,
-        target_params=c_params,
-        opt_state=c_optimiser.init(c_params))
+#    # actor/critic models setup
+#    actor = hk.transform(actor_fw)
+#    critic = hk.transform(critic_fw)
+#    a_apply = jax.jit(actor.apply)
+#    c_apply = jax.jit(critic.apply)
+#    
+#    # actor parameters initialization
+#    a_params = actor.init(act_key, 
+#            envs.feat_rec[0], envs.feat_lig[0], envs._rec[0], envs.m_lig[0],
+#            envs.e_rec[0], envs.s_rec[0], envs.n_rec[0],
+#            envs.e_lig[0], envs.s_lig[0], envs.n_lig[0],
+#            envs.e_int[0], envs.s_int[0], envs.n_int[0])
+#
+#    # critic parameters initialization
+#    action = a_apply(a_params, None,
+#            envs.f_rec[0], envs.f_lig[0], envs.m_rec[0], envs.m_lig[0],
+#            envs.e_rec[0], envs.s_rec[0], envs.n_rec[0],
+#            envs.e_lig[0], envs.s_lig[0], envs.n_lig[0],
+#            envs.e_int[0], envs.s_int[0], envs.n_int[0])
+#    
+#    action = adjust_action(action[None,:])
+#
+#    c_params = critic.init(crit_key,
+#            envs.f_rec[0], envs.f_lig[0], envs.m_rec[0], envs.m_lig[0],
+#            envs.e_rec[0], envs.s_rec[0], envs.n_rec[0],
+#            envs.e_lig[0], envs.s_lig[0], envs.n_lig[0],
+#            envs.e_int[0], envs.s_int[0], envs.n_int[0],
+#            action)
+#
+#    # duplicate and group actor/critic params, init optimizer
+#    a_optimiser = optax.adam(learning_rate=args.learning_rate)
+#    c_optimiser = optax.adam(learning_rate=args.learning_rate*10)
+#
+#    actor_state = TrainState(
+#        params=a_params,
+#        target_params=a_params,
+#        opt_state=a_optimiser.init(a_params))
+#
+#    critic_state = TrainState(
+#        params=c_params,
+#       jnp.where( target_params=c_params,
+#        opt_state=c_optimiser.init(c_params))
 
     print ('Initialization completed! -', time.time()-s)
 
@@ -375,31 +325,35 @@ if __name__ == "__main__":
             print (f'Buffer full! - {time.time()-sg}')
             sg = time.time()
 
-        # generate PRNG keys
-        key, keys1, keys2, keys3 = jrn.split(key, 4)
-        keys1 = jnp.stack(jrn.split(key, envs.number))
-        keys2 = jnp.stack(jrn.split(key, envs.number))
-        keys3 = jnp.stack(jrn.split(key, envs.number))
-
         # get state
-        envs.edge_int, envs.send_int, envs.neigh_int = envs.get_state()
+        (envs.edge_int, envs.send_int, envs.neigh_int,
+         envs.intmask_rec, envs.intmask_lig,
+         envs.rimmask_rec, envs.rimmask_lig) = envs.get_state()
 
-        actions = vmap(partial(a_apply, a_params, None))(
-                envs.feat_rec, envs.feat_lig, envs.mask_rec, envs.mask_lig, 
-                envs.edge_rec, envs.send_rec, envs.neigh_rec,
-                envs.edge_lig, envs.send_lig, envs.neigh_lig,
-                envs.edge_int, envs.send_int, envs.neigh_int,)
+        # generate random action
+        key, keyn = jrn.split(key, 2)
+        actions = envs.get_random_action(keyn)
 
+        # generate agent action
+#        actions = vmap(partial(a_apply, a_params, None))(
+#                envs.feat_rec, envs.feat_lig, envs.mask_rec, envs.mask_lig, 
+#                envs.edge_rec, envs.send_rec, envs.neigh_rec,
+#                envs.edge_lig, envs.send_lig, envs.neigh_lig,
+#                envs.edge_int, envs.send_int, envs.neigh_int,)
+        
         # add noise to action
 
         # apply action
         dmaps, coord_lig = envs.step(envs.coord_rec, envs.coord_lig, actions)
         
         # get new state
-        envs.edge_int, envs.send_int, envs.neigh_int = envs.get_state()
+        (edge_int, send_int, neigh_int,
+         intmask_rec, intmask_lig, rimmask_rec, rimmask_lig) = envs.get_state()
 
         # get reward for last action
-        rewards = envs.get_rewards(dmaps)
+        contacts, clashes, dist = envs.get_rewards(dmaps)
+        print (f'Contacts: {contacts}, Clashes: {clashes}, Distances: {dist}')
+        rewards = vmap(lambda x, y, z: x+(y-z), contacts, clashes, dist)
         rewards_episode.append(rewards)
 
         # store experiences in replay buffer
@@ -425,9 +379,9 @@ if __name__ == "__main__":
             print ('Reset!')
 
         # network updates
-        if global_step+1 > args.buffer_size \
-        and (global_step+1) % args.policy_frequency == 0:
-            
+        #if global_step+1 > args.buffer_size \
+        #and (global_step+1) % args.policy_frequency == 0:
+        if False:    
             gpus = jax.devices('gpu')
             key, pkey = jrn.split(key, 2)
 
@@ -477,30 +431,27 @@ if __name__ == "__main__":
     plt.savefig('reward.png')
 
     for global_step in range(args.test_steps):
-        # run actor
-        actions = a_apply(a_params, None,
-                envs_test.e_rec[0], envs_test.s_rec[0], envs_test.r_rec[0], envs_test.n_rec[0],
-                envs_test.e_lig[0], envs_test.s_lig[0], envs_test.r_lig[0], envs_test.n_lig[0],
-                envs_test.e_int[0], envs_test.s_int[0], envs_test.r_int[0])
-       
-        actions = jnp.concatenate((quat_from_pred(actions[None,:3]), actions[None,3:]), axis=-1)
 
-        dmaps, c_lig_next, \
-        e_int_next, s_int_next, r_int_next = envs_test.step(envs_test.c_lig, actions)
-        n_lig_next = jnp.concatenate(
-                [envs_test.n_lig[:,:,:-3], c_lig_next], axis=-1)
+        # get state
+        tenvs.edge_int, tenvs.send_int, tenvs.neigh_int = tenvs.get_state()
 
-        envs_test.c_lig = c_lig_next
-        envs_test.e_int = e_int_next
-        envs_test.s_int = s_int_next
-        envs_test.r_int = r_int_next
-        envs_test.n_lig = n_lig_next
+        # get action
+        actions = vmap(partial(a_apply, a_params, None))(
+                tenvs.feat_rec, tenvs.feat_lig, tenvs.mask_rec, tenvs.mask_lig,
+                tenvs.edge_rec, tenvs.send_rec, tenvs.neigh_rec,
+                tenvs.edge_lig, tenvs.send_lig, tenvs.neigh_lig,
+                tenvs.edge_int, tenvs.send_int, tenvs.neigh_int,)
+
+        # apply action
+        dmaps, coord_lig = tenvs.step(tenvs.coord_rec, tenvs.coord_lig, actions)
+
+        tenvs.coord_lig = coord_lig
+        reward = tenvs.get_rewards(dmaps)
 
         # apply action to full atom structure
         out_models = unfold_entities(out_struc, 'M')
         out_struc = save_to_model(out_struc, out_models[-1], actions[0,:4], actions[0,4:-1])
         
-        reward = envs_test.get_rewards(dmaps)
         print (f'Completed episode {global_step+1} - {time.time()-sg}')
         print (f'Writing --- Reward: {reward}')
 
