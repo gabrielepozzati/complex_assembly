@@ -2,98 +2,79 @@ import haiku as hk
 from networks.modules import *
 
 class Critic(hk.Module):
+    def __init__(self, config):
+        super().__init__(name='Critic')
 
-    def __init__(self, num_heads, num_channels):
+        self.ch = config['channels']
+        self.un = config['update_number']
+        self.mlp = config['mlp_layers']
 
-        super().__init__(name='Actor')
+        self.action_update = vmap(MLP(self.ch, int(self.ch/2), self.mlp, name='action_update'))
 
-        #base node/edge encoding
-        self.encoding = GraphEncoding(num_channels)
-        self.action_encoding = MultiLayerPerceptron(num_channels, num_channels, 2)
+        self.node_layers1, self.node_layers2, self.edge_layers = [], [], []
+        for n in range(self.un):
+            self.node_layers1.append(vmap(MPNN(config, False, name=f'action_MPNN{n}')))
+            self.edge_layers.append(vmap(MPNN(config, True, name=f'pivot_MPNN{n}')))
+            self.node_layers2.append(vmap(MPNN(config, False, name=f'eval_MPNN{n}')))
 
-        # surface encoding 
-        self.single_stack = [AttentionGraphStack(num_heads, num_channels, node_a=False, edge_a=False) \
-                for n in range(1)]
+        self.global_update = vmap(MLP(self.ch, int(self.ch/2), self.mlp, name='global_update'))
+        self.out_update = Linear(self.ch, num_input_dims=2, name='out')
 
-        self.interaction_stack = [AttentionGraphStack(num_heads, num_channels, node_a=False, edge_a=False) \
-                for n in range(1)]
 
-        # transformation graph updates
-        self.docking_stack = [AttentionGraphStack(num_heads, num_channels, node_a=False, edge_a=False) \
-                for n in range(1)]
-
-        # confidence output
-        self.out_block = MultiLayerPerceptron(num_channels, num_channels, 1)
-        self.value = Linear(1)
-
-    def __call__(self, 
-            e_rec, s_rec, r_rec, n_rec,
-            e_lig, s_lig, r_lig, n_lig,
-            e_int, s_int, r_int, action):
+    def __call__(self, masks, nodes, edges, i_s, j_s, actions):
  
-        identity = jnp.array((1.,0.,0.,0.,0.,0.,0.,0.))
-        identity = self.action_encoding(identity)
-        action = self.action_encoding(action)
+        (padmask_recs, padmask_ligs, 
+         intmask_recs, intmask_ligs, 
+         rimmask_recs, rimmask_ligs, 
+         node_recs, node_ligs, 
+         edge_recs, edge_ligs, edge_ints, 
+         i_recs, i_ligs, i_ints, 
+         j_recs, j_ligs, j_ints) = vmap(unfold_features)(masks, nodes, edges, i_s, j_s)
 
-        g_rec = jraph.GraphsTuple(
-                nodes=n_rec, edges=e_rec,
-                senders=s_rec, receivers=r_rec,
-                n_node=jnp.array([n_rec.shape[0]]),
-                n_edge=jnp.array([e_rec.shape[0]]),
-                globals=identity)
+        # merge a complete graph without node information
+        blanks = jnp.concatenate((padmask_recs[:,:,None], padmask_ligs[:,:,None]), axis=1)
+        all_edges = jnp.concatenate((edge_recs, edge_ligs, edge_ints), axis=1)
+        all_is = jnp.concatenate((i_recs, i_ligs+400, i_ints), axis=1)
+        all_js = jnp.concatenate((j_recs, j_ligs+400, j_ints), axis=1)
 
-        g_lig = jraph.GraphsTuple(
-                nodes=n_lig, edges=e_lig,
-                senders=s_lig, receivers=r_lig,
-                n_node=jnp.array([n_lig.shape[0]]),
-                n_edge=jnp.array([e_lig.shape[0]]),
-                globals=action)
+        # enrich nodes with full-graph structural info
+        all_nodes = blanks
+        for n in range(self.un):
+            all_nodes = self.node_layers1[n](all_nodes, edges, all_is, all_js)
+            all_nodes *= blanks
 
-        # receptor/ligand encoding
-        g_rec = self.encoding(g_rec)
-        g_lig = self.encoding(g_lig)
-        #g_rec._replace(globals=jnp.zeros(action.shape))
-        #g_lig._replace(globals=action)
+        # refine action feature to concatenate with nodes
+        fillers = jnp.zeros(actions[:,0,:].shape)
+        Ps = jnp.squeeze(actions[:,0,:])
+        p1s = jnp.squeeze(actions[:,1,:])
+        p2s = jnp.squeeze(actions[:,2,:])
+        action_Ps = jnp.concatenate((fillers, Ps), axis=1)
+        action_p1p2s = jnp.concatenate((p2s, p1s), axis=1)
+        actions = jnp.concatenate(
+                (action_Ps[:,:,None], action_p1p2s[:,:,None]), axis=2)
 
-        # elaborate surface level info
-        for module in self.single_stack:
-            g_rec = module(g_rec)
-            g_lig = module(g_lig)
+        # merge action with edge-enriched information and update
+        actions = jnp.concatenate((all_nodes, actions), axis=2)
+        actions = self.action_update(actions)
 
-        # elaborate interface level info
-        g_int = jraph.GraphsTuple(
-                nodes=jnp.concatenate((g_rec.nodes, g_lig.nodes), axis=0),
-                edges=self.encoding.e_enc(e_int),
-                senders=s_int, receivers=r_int,
-                n_node=jnp.array([g_rec.n_node+g_lig.n_node]),
-                n_edge=jnp.array([e_int.shape[0]]),
-                globals=action)
+        # merge back into structural enriched nodes
+        all_nodes = jnp.concatenate((all_nodes, actions), axis=2)
 
-        for module in self.interaction_stack: g_int = module(g_int)
+        # update edges based on full interaction graph
+        for n in range(self.un):
+            all_nodes, all_edges = self.edge_layers[n](all_nodes, all_edges, all_is, all_js)
+            all_nodes = jnp.concatenate((all_nodes, actions), axis=2)
 
-        # union of rec, lig and int edges and skip connection of int nodes  
-        all_nodes = jnp.concatenate((g_rec.nodes, g_lig.nodes, g_int.nodes), axis=0)
-        all_edges = jnp.concatenate(
-                (g_rec.edges, g_lig.edges, g_int.edges), axis=0)
-        all_senders = jnp.concatenate(
-                (g_rec.senders, g_lig.senders+400, g_int.senders), axis=0)
-        all_receivers = jnp.concatenate(
-                (g_rec.receivers, g_lig.receivers+400, g_int.receivers), axis=0)
-        agg_globals = g_rec.globals+g_lig.globals+g_int.globals
-
-        g_int = jraph.GraphsTuple(
-                nodes=all_nodes, edges=all_edges,
-                senders=all_senders, receivers=all_receivers,
-                n_node=jnp.array([all_nodes.shape[0]]), 
-                n_edge=jnp.array([all_edges.shape[0]]),
-                globals=agg_globals)
-
-        # elaborate all info to derive final global feature
-        for module in self.docking_stack: g_int = module(g_int)
+        # group original node info and update full interaction graph
+        ori_nodes = jnp.concatenate((node_recs, node_ligs), axis=1)
         
-        # elaborate q-value
-        q = self.out_block(g_int.globals)
-        q = (jax.nn.sigmoid(self.value(q))*200)-100
+        all_nodes = ori_nodes
+        for n in range(self.un):
+            all_nodes = self.node_layers2[n](all_nodes, all_edges, all_is, all_js)
+            all_nodes = jnp.concatenate((all_nodes, ori_nodes), axis=2)
 
-        return q
+        # aggregate graph to a single value
+
+        all_nodes = self.global_update(all_nodes)
+        return jax.nn.sigmoid(self.out_update(all_nodes))
 

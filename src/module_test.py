@@ -8,8 +8,10 @@ import argparse
 import numpy as np
 import pickle as pkl
 import seaborn as sb
-import matplotlib.pyplot as plt
 from functools import partial
+from mpl_toolkits import mplot3d
+import matplotlib.pyplot as plt
+
 
 import jax
 import jax.numpy as jnp
@@ -17,11 +19,13 @@ import jax.random as jrn
 from jax import vmap
 from jax import tree_util
 from replay_buffer import *
+from quaternions import *
 from environment import *
 from features import *
 from ops import *
 
 from Bio.PDB import PDBIO, PDBParser
+from Bio.PDB.Atom import Atom
 from Bio.PDB.Model import Model
 from Bio.PDB.Structure import Structure
 from Bio.PDB.SASA import ShrakeRupley
@@ -33,6 +37,7 @@ from Bio.PDB.Selection import unfold_entities
 io = PDBIO()
 pdbp = PDBParser(QUIET=True)
 sasa = ShrakeRupley()
+
 
 def set_idx_bvalue(idxs, struc):
     idx = 0
@@ -132,26 +137,128 @@ def out_action(struc_rec, struc_lig, action):
     write_new_model('test_LIG.pdb', struc_rec, struc_lig)
 
 
-def out_pose(name_id, struc_rec, struc_lig, R, t):
-    atoms = jnp.array([atom.get_coord() for atom in unfold_entities(struc_lig, 'A')])
-    atoms = (R@atoms.T).T
-    atoms += t[None,:]
+def generate_random_sequence(key, sruc_lig, env, N=500):
+
+    new_model = copy.deepcopy(struc_lig[0])
+    new_model.detach_parent()
+
+    count = 0
+    key, keyn = jrn.split(key, 2)
+    actions = env.get_random_action(keyn, env.intmask_ligs,
+            env.rimmask_recs, env.rimmask_ligs)
+    Ps, p0s, p1s = env.refine_action(env.coord_ligs, actions)
+    quats = vmap(quat_from_pivoting)(Ps, p0s, p1s)
+
+    for n in range(N):
+        print (f'####################### ACTION {n}')
+        
+        intmask_recs = jnp.squeeze(jnp.argwhere(env.intmask_recs==1)[:,1])
+        intmask_ligs = jnp.squeeze(jnp.argwhere(env.intmask_ligs==1)[:,1])
+        rimmask_recs = jnp.squeeze(jnp.argwhere(env.rimmask_recs==1)[:,1])
+        rimmask_ligs = jnp.squeeze(jnp.argwhere(env.rimmask_ligs==1)[:,1])
+        print ('rec int', intmask_recs)
+        print ('lig int', intmask_ligs)
+        print ('rec rim', rimmask_recs)
+        print ('lig rim', rimmask_ligs)
+
+        print ('CHECK ACTION...')
+        coord_ligs = env.step(env.coord_ligs, Ps, quats)
+
+        dmaps = vmap(distances_from_coords)(
+                env.coord_recs[:,:,None,:], coord_ligs[:,None,:,:])
+        dmaps = vmap(lambda x,y,z: x*y[:,None]*z[None,:])(
+                dmaps, env.padmask_recs, env.padmask_ligs)
+        dmaps = jnp.where(dmaps!=0, dmaps, 1e6)
+
+        notice = True
+        while jnp.min(dmaps)<3 or jnp.min(dmaps)>8 or count==24:
+            if notice: print ('SCREENING...')
+            key, keyn = jrn.split(key, 2)
+            actions = env.get_random_action(keyn, env.intmask_ligs,
+                    env.rimmask_recs, env.rimmask_ligs)
+            Ps, p0s, p1s = env.refine_action(env.coord_ligs, actions)
+            quats = vmap(quat_from_pivoting)(Ps, p0s, p1s)
+
+            coord_ligs = env.step(env.coord_ligs, Ps, quats)
+
+            dmaps = vmap(distances_from_coords)(
+                    env.coord_recs[:,:,None,:], coord_ligs[:,None,:,:])
+            dmaps = vmap(lambda x,y,z: x*y[:,None]*z[None,:])(
+                    dmaps, env.padmask_recs, env.padmask_ligs)
+            dmaps = jnp.where(dmaps!=0, dmaps, 1e6)
+            notice = False
+            count = 0
+        print ('OK! --- Action ->', actions)
+
+        env.coord_ligs = coord_ligs
+        count += 1
+
+        new_model = out_pose(n, new_model, quats, Ps)
+        new_model.id = n+1
+        struc_lig.add(copy.deepcopy(new_model))
+
+        (edge_ints, send_ints, neigh_ints,
+         env.intmask_recs, env.intmask_ligs,
+         env.rimmask_recs, env.rimmask_ligs) = env.get_state(env.coord_ligs)
+
+        if (n%500)==0:
+            io.set_structure(copy.deepcopy(struc_lig))
+            io.save('test_100ACT.pdb')
+
+    io.set_structure(struc_lig)
+    io.save('test_100ACT.pdb')
+
+
+def check_edges(env):
+    a = jnp.array([
+        [1,0,0],[3,0,0],[5,0,0],
+        [10,0,0],[20,0,0],[25,0,0],
+        [45,0,0],[90,0,0],[200,0,0],
+        [500,0,0],[501,0,0],[505,0,0],
+        [0,0,0],[0,0,0],[0,0,0]])
+
+    ma = jnp.array((1,1,1,1,1,1,1,1,1,1,1,1,0,0,0))
+
+    b = jnp.array([
+        [4,0,0],[8,0,0],[15,0,0],
+        [30,0,0],[60,0,0],[120,0,0],
+        [240,0,0],[360,0,0],[1060,0,0],
+        [1061,0,0],[0,0,0],[0,0,0],
+        [0,0,0],[0,0,0],[0,0,0]])
+
+    mb = jnp.array((1,1,1,1,1,1,1,1,1,1,0,0,0,0,0))
+
+    dmaps = vmap(distances_from_coords)(a[None,:,None,:], b[None,None,:,:])
+    dmaps = dmaps*ma[None,:,None]*mb[None,None,:]
+    dmaps = jnp.squeeze(dmaps)
+    edges, nodes, neighs = env.get_edges(5, 12, dmaps)
+    print (a)
+    print (b)
+    
+    print (dmaps)
+
+    print ('edge', edges)
+    print ('nodes', nodes)
+    print ('neigh', neighs)
+
+
+def out_pose(name_id, struc_lig, quats, Ps):
+    atom_objects = unfold_entities(struc_lig, 'A')
+    atoms = jnp.array([atom.get_coord() for atom in atom_objects])
+    
+    atoms -= Ps
+    atoms = quat_rotation(atoms, jnp.squeeze(quats))
+    atoms += Ps
 
     idx = 0
-    for chain in struc_lig[0]:
-        for residue in chain:
-            for atom in residue:
-                atom.set_coord(atoms[idx])
-                idx += 1
-
-    write_new_model(f'test_ACT{name_id}.pdb', struc_rec, copy.deepcopy(struc_lig))
+    for atom in atom_objects:
+            atom.set_coord(atoms[idx])
+            idx += 1
+    
     return struc_lig
 
-def is_rotation(M):
-    return jnp.matmul(M, M.T), jnp.linalg.det(M)
 
 if __name__ == "__main__":
-    key = jrn.PRNGKey(42)
     data_path = '/home/pozzati/complex_assembly/data'
     test, test_code = load_dataset(data_path+'/dataset_features', size=1)
     print (test_code)
@@ -170,31 +277,11 @@ if __name__ == "__main__":
     key = jrn.PRNGKey(42)
     env = DockingEnv(test, 10, 400, key)
     print ('Length of non-padding seqs')
-    print (env.lengths_rec, env.lengths_lig)
+    print (env.length_recs, env.length_ligs)
 
-    (edge_int, send_int, neigh_int,
-     env.intmask_rec, env.intmask_lig, 
-     env.rimmask_rec, env.rimmask_lig) = env.get_state(env.coord_lig)
-
-    intmask_rec = jnp.squeeze(jnp.argwhere(env.intmask_rec==1)[:,1])
-    intmask_lig = jnp.squeeze(jnp.argwhere(env.intmask_lig==1)[:,1])
-    rimmask_rec = jnp.squeeze(jnp.argwhere(env.rimmask_rec==1)[:,1])
-    rimmask_lig = jnp.squeeze(jnp.argwhere(env.rimmask_lig==1)[:,1])
-
-    print ('rec int')
-    print (intmask_rec)
-    print ('lig int')
-    print (intmask_lig)
-    print ('rec rim')
-    print (rimmask_rec)
-    print ('lig rim')
-    print (rimmask_lig)
-
-    #action = env.get_random_action(key)
-    #print ('action')
-    #print (action)
-
-    #new_coord_lig, R, t = env.step(env.coord_rec, env.coord_lig, action)
+    (edge_ints, send_ints, neigh_ints,
+     env.intmask_recs, env.intmask_ligs, 
+     env.rimmask_recs, env.rimmask_ligs) = env.get_state(env.coord_ligs)
 
     ##############################################
     # test restoring coordinates and visualize ASA
@@ -228,16 +315,11 @@ if __name__ == "__main__":
     #################
     # visualize step
     #################
-    for n in range(10):
-        action = env.get_random_action(key)
-        env.coord_lig, R, t = env.step(env.coord_rec, env.coord_lig, action)
-        I, det = is_rotation(R[0])
-        print ('\n\n',I, det)
 
-        struc_lig = out_pose(n, copy.deepcopy(struc_rec), struc_lig, R[0], t[0])
-        
-        (edge_int, send_int, neigh_int,
-         env.intmask_rec, env.intmask_lig,
-         env.rimmask_rec, env.rimmask_lig) = env.get_state(env.coord_lig)
+    #generate_random_sequence(key, struc_lig, env)
 
+    ########################################
+    # check edges
+    ########################################
 
+    check_edges(env)

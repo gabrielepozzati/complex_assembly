@@ -7,7 +7,7 @@ import pickle as pkl
 from functools import partial
 import jax.numpy as jnp
 import pdb as debug
-from jax import vmap
+from jax import vmap, jit
 
 def load_dataset(path, size=None, skip=0):
     count = 0
@@ -32,50 +32,149 @@ def load_dataset(path, size=None, skip=0):
 
 
 @jax.jit
+def rmsd(set1, set2, coord_num):
+    residual_sum = jnp.sum(jnp.subtract(set1,set2)**2)
+    return jnp.sqrt(residual_sum/coord_num)
+
+
+@jax.jit
 def distances_from_coords(coords1, coords2):
     return jnp.sqrt(jnp.sum((coords1-coords2)**2, axis=-1))
 
 
-#@partial(jax.jit, static_argnums=5)
-def get_edges(cmap, local1, local2, cloud1, cloud2, enum):
-  
-  def _get_residue_edges(line):
+@jax.jit
+def one_hot_distances(distances, bin_size=1):
+    last = jnp.where(distances>32, 1, 0)
+    bins = jnp.arange(32,0,-bin_size)
+    one_hot = [jnp.where((distances<=n) & (distances>n-bin_size), 1, 0) for n in bins]
+    return jnp.flip(jnp.stack([last]+one_hot, axis=-1), axis=-1)
 
-    def _next_lowest(min_val, array):
-      array = jnp.where(array>min_val, array, array+10e6)
-      next_val = jnp.min(array)
-      return next_val, jnp.argwhere(array==next_val, size=1)
+
+def illegal_interfaces(dmaps, config, debug):
+    dmaps = jnp.where(dmaps==0, 1e9, dmaps)
+    distances = vmap(lambda x: jnp.min(x))(dmaps)
     
-    sorting_input = jnp.broadcast_to(line[None,:], (enum, line.shape[0]))
-    sorted_idxs = jnp.squeeze(jax.lax.scan(_next_lowest, 0, sorting_input)[1])
-    sorted_line = line[sorted_idxs]
-    return sorted_line, sorted_idxs
-  
-  def _get_relative_features(local_i, local_j, coord_i, coord_j):
-    basis = jnp.stack(local_i, axis=0)
-    q_ij = jnp.matmul(basis, (coord_j-coord_i))
-    k_ij = jnp.matmul(basis, local_j[0])
-    t_ij = jnp.matmul(basis, local_j[1])
-    s_ij = jnp.matmul(basis, local_j[2])
-    feats = jnp.concatenate((q_ij, k_ij, t_ij, s_ij), axis=0)
-    return jnp.transpose(feats)
+    if debug: print (distances)
 
-  def _get_distance_features(dist):
-    scales = 1.5 ** (jnp.indices((15,))[0]+1)
-    return jnp.exp(-((dist ** 2) / scales))
+    if jnp.any(distances > config['interface_threshold']) \
+    or jnp.any(distances < config['clash_threshold']): return True
+    else: return False
 
-  nodes_i = jnp.indices((cmap.shape[0],))[0]
-  nodes_i = jnp.broadcast_to(nodes_i[:,None], (cmap.shape[0], enum))
-  dist, neighs_j = vmap(_get_residue_edges)(cmap)
-  dist, nodes_i, neighs_j = jnp.ravel(dist), jnp.ravel(nodes_i), jnp.ravel(neighs_j),
 
-  local_i, cloud_i = local1[nodes_i], cloud1[nodes_i]
-  local_j, cloud_j = local2[neighs_j], cloud2[neighs_j]
-  rfeats = vmap(_get_relative_features)(local_i, local_j, cloud_i, cloud_j)
-  dfeats = vmap(_get_distance_features)(dist)
-  edges = jnp.concatenate((rfeats, dfeats), axis=-1)
+def get_illegal_idxs(dmaps, config):
+    dmaps = jnp.where(dmaps==0, 1e9, dmaps)
+    distances = vmap(lambda x: jnp.min(x))(dmaps)
 
-  return (edges, nodes_i, neighs_j)
+    i_thr = config['interface_threshold']
+    c_thr = config['clash_threshold']
+
+    return jnp.argwhere((distances>i_thr)|(distances < c_thr))
+
+
+def kabsch(dept, dest):
+    '''
+    Move dept. points to fit dest. equivalents as best as possible
+    '''
+    dept_mean = jnp.mean(dept, axis=0, keepdims=True)
+    dest_mean = jnp.mean(dest, axis=0, keepdims=True)
+
+    A = jnp.transpose(dest - dest_mean) @ (dept - dept_mean)
+    U, S, Vt = jnp.linalg.svd(A)
+    V = Vt.T
+    U = U.T
+
+    corr_mat = jnp.diag(jnp.array([1,1,jnp.sign(jnp.linalg.det(V@U))]))
+    R = V @ (corr_mat @ U)
+    t = dest_mean - jnp.transpose(R @ jnp.transpose(dept_mean))
+    return R, jnp.squeeze(t)
+
+def get_distances(min_dist, max_dist, c_rec, idxs, dist):
+    '''
+    given 3 values between 0 and 1 contained in dist, and a range 
+    between min and max, map first value in said range, and map 
+    remaining 2 values to get distances that allow precise trilateration 
+    respective to the three points defined by c_rec[idxs]
+    '''
+    d1, d2, d3 = dist
+    p1, p2, p3 = c_rec[idxs[2:]]
+    d12 = jnp.linalg.norm(p1-p2)
+    max_dist = jnp.maximum(max_dist, d12)
+
+    # compute distance between p1 and ligand point
+    d1l = (max_dist-min_dist)*d1+min_dist
+
+    # compute lower distance limit btw p2 and ligand point
+    min_d2l = jnp.abs((d1l-d12))
+
+    # compute distance between p2 and ligand point
+    d2l = (max_dist-min_d2l)*d2+min_d2l
+
+    # compute center/radius/normal of intersection circle
+    # btw sphere1 and sphere2
+    d_p1_cc = 0.5*(d12+(d1l**2-d2l**2)/d12)
+    cc = p1+d_p1_cc*(p2-p1)/d12
+    cr = jnp.sqrt(d1l**2-d_p1_cc**2)
+    cn = (p1-cc)/jnp.linalg.norm(p1-cc)
+
+    # compute lower and upper distance limits btw p3 and ligand point
+    delta = p3 - cc
+    Ndelta = jnp.dot(cn, delta)
+    crossNdelta = jnp.cross(cn,delta)
+    radial_low = jnp.linalg.norm(crossNdelta) - cr
+    radial_high = jnp.linalg.norm(crossNdelta) + cr
+    min_d3l = jnp.sqrt(Ndelta**2+radial_low**2)
+    max_d3l = jnp.sqrt(Ndelta**2+radial_high**2)
+
+    # compute distance between p3 and ligand point
+    d3l = (max_d3l-min_d3l)*d3+min_d3l
+
+    return jnp.array([d1l, d2l, d3l])
+
+
+def trilateration(c_rec, l_rec, idxs, dist):
+    p1, p2, p3 = c_rec[idxs[2:]]
+    r1, r2, r3 = dist
+
+    e_x=(p2-p1)/jnp.linalg.norm(p2-p1)
+    i=jnp.dot(e_x,(p3-p1))
+    e_y=(p3-p1-(i*e_x))/(jnp.linalg.norm(p3-p1-(i*e_x)))
+    e_z=jnp.cross(e_x,e_y)
+    d=jnp.linalg.norm(p2-p1)
+    j=jnp.dot(e_y,(p3-p1))
+    x=((r1**2)-(r2**2)+(d**2))/(2*d)
+    y=(((r1**2)-(r3**2)+(i**2)+(j**2))/(2*j))-((i/j)*(x))
+    z1 = jnp.sqrt(r1**2-x**2-y**2)
+    z2 = jnp.sqrt(r1**2-x**2-y**2)*(-1)
+    l1 = p1+(x*e_x)+(y*e_y)+(z1*e_z)
+    l2 = p1+(x*e_x)+(y*e_y)+(z2*e_z)
+
+    c_rec_mean = jnp.sum(c_rec, axis=0)/l_rec
+    d1 = jnp.linalg.norm(l1-c_rec_mean)
+    d2 = jnp.linalg.norm(l2-c_rec_mean)
+    select = jnp.argmax(jnp.array((d1,d2)))
+    return jnp.array((l1, l2))[select]
+
+
+def unfold_features(mask, nodes, edges, i, j):
+    mask_rec, mask_lig = jnp.split(mask, 2, axis=0)
+    padmask_rec, intmask_rec, rimmask_rec = mask_rec[:,0], mask_rec[:,1], mask_rec[:,2]
+    padmask_lig, intmask_lig, rimmask_lig = mask_lig[:,0], mask_lig[:,1], mask_rec[:,2]
+
+    nodes_rec, nodes_lig = jnp.split(nodes, 2, axis=0)
+
+    edges_intra, edges_int = jnp.split(edges, 2, axis=0)
+    i_intra, i_int = jnp.split(i, 2, axis=0)
+    j_intra, j_int = jnp.split(j, 2, axis=0)
+
+    edges_rec, edges_lig = jnp.split(edges_intra, 2, axis=0)
+    i_rec, i_lig = jnp.split(i_intra, 2, axis=0)
+    j_rec, j_lig = jnp.split(j_intra, 2, axis=0)
+    
+    return (padmask_rec, padmask_lig, intmask_rec, intmask_lig, 
+            rimmask_rec,  rimmask_lig, nodes_rec, nodes_lig, 
+            edges_rec, edges_lig, edges_int, 
+            i_rec, i_lig, i_int, 
+            j_rec, j_lig, j_int)
 
 
 ### TODO WRITE AS A CLASS

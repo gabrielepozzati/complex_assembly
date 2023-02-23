@@ -40,6 +40,11 @@ H_MASK = jnp.stack(
      H2_MASK, H3_MASK))
 
 def quat_from_pred(array):
+    '''
+    given array of shape (3,) containing values between 0 and 1 
+    define a corresponding quaternion
+    '''
+
     ndims = len(array.shape)
     if ndims == 1: array = jnp.expand_dims(array, axis=0)
 
@@ -50,6 +55,25 @@ def quat_from_pred(array):
     array = jnp.concatenate((jnp.ones(ones_shape), array), axis=-1)
     return array/norm_factor
 
+
+def quat_from_pivoting(P, p0, p1):
+    '''
+    P = pivot coordinates
+    p0 = starting point coordinates
+    p1 = ending point coordinates
+    '''
+
+    p0 = (p0-P)/jnp.linalg.norm(p0-P)
+    p1 = (p1-P)/jnp.linalg.norm(p1-P)
+
+    dot = jnp.dot(p0, p1)
+    axis = jnp.cross(p0, p1)
+    axis /= jnp.linalg.norm(axis)
+    angle = jnp.clip(jnp.arccos(dot), a_min=0, a_max=jnp.pi/12)
+    s = jnp.sin(angle/2)
+    return jnp.array((jnp.cos(angle/2), axis[0]*s, axis[1]*s, axis[2]*s))
+
+
 def matrix_from_quat(q):
     a, b, c, d = q
     aa, bb, cc, dd = a**2, b**2, c**2, d**2
@@ -58,22 +82,6 @@ def matrix_from_quat(q):
          [2*b*c+2*a*d, aa-bb+cc-dd, 2*c*d-2*a*b],
          [2*b*d-2*a*c, 2*c*d+2*a*b, aa-bb-cc+dd]])
 
-#@jax.jit
-def distances_from_cloud(matrix1, matrix2):
-    return jnp.sqrt(jnp.sum((matrix1-matrix2)**2, axis=-1))
-
-#@jax.jit
-def encode_distances(distances):
-    transform_far = 1-(3/jnp.clip(distances, a_min=3))
-    transform_close = 1-(jnp.clip(distances, a_max=12)/12)
-    return jnp.stack((transform_close, transform_far), axis=-1)
-
-#@jax.jit
-#def one_hot_distances(distances, bin_size=1):
-#    last = jnp.where(distances>32, 1, 0)
-#    bins = jnp.arange(32,0,-bin_size)
-#    one_hot = [jnp.where((distances<=n) & (distances>n-bin_size), 1, 0) for n in bins]
-#    return jnp.flip(jnp.stack([last]+one_hot, axis=-1), axis=-1)
 
 def quat_rotation(cloud, q):
     #quaternion coordinates
@@ -88,33 +96,21 @@ def quat_rotation(cloud, q):
     qp = quat_product(q[None,None,:], p[:,:,:])
     return quat_product(qp[:,None,:], q_i[None,:,:])[:,1:]
 
+
 def hamilton_multiplier(q):
     return jnp.sum(q[:,None,None]*H_MASK[:,:,:], axis=-3)
+
 
 def quat_product(q1, q2):
     return jnp.sum(q1*q2, axis=-1)
 
-#def quat_rotation(cloud, q, substeps):
-#    #quaternion coordinates
-#    zeros = jnp.zeros((cloud.shape[0], 1))
-#    p = jnp.concatenate((zeros, cloud), axis=-1)
-#    p = hamilton_multiplier(p)
-#
-#    #inverse quaternion
-#    q_i = jnp.concatenate((q[:,:1], -q[:,1:]), axis=-1)
-#    q_i = hamilton_multiplier(q_i)
-#
-#    qp = quat_product(q[:,None,None,:], p[None,:,:,:])
-#    return quat_product(qp[:,:,None,:], q_i[:,None,:,:])[:,:,1:]
-#
-#def hamilton_multiplier(q):
-#    return jnp.sum(q[:,:,None,None]*H_MASK[None,:,:,:], axis=1)
 
 def quat_composition(q1, q2):
     q2 = jnp.sum(q2[:,None,None]*H_MASK[:,:,:], axis=0)
     return jnp.sum(q1[None,:]*q2, axis=-1)
 
-def main():
+
+def test():
     q_I = jnp.array([1.,0.,0.,0.])
     q_x90 = jnp.array([0.7071,0.7071,0.,0.])
     q_y90 = jnp.array([0.7071,0.,0.7071,0.])
@@ -159,5 +155,5 @@ def main():
     io.save('test.pdb')
 
 if __name__ == '__main__':
-    main()
+    test()
 

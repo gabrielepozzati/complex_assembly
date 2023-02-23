@@ -2,6 +2,7 @@ import os
 import sys
 import glob
 import time
+import json
 import pickle
 import jax.numpy as jnp
 import pdb as debug
@@ -24,13 +25,6 @@ figure(figsize=(100, 100), dpi=100)
 import seaborn as sb
 
 sasa = ShrakeRupley()
-
-#def pad(array, axes=1, size=1000):
-#    pad_size = size-array.shape[0]
-#    other_axes = len(array.shape)-axes
-#    if other_axes > 0: pad_shape = (((0,pad_size))*axes, ((0,0))*other_axes)
-#    else: pad_shape = ((0,pad_size))*axes
-#    return jnp.pad(array, pad_shape)
 
 #def filter_surface(array, surf_mask):
 #    return jnp.stack([line for line, asa in zip(array, surf_mask) if asa>=0.2], axis=0)
@@ -59,6 +53,10 @@ def format_data(code, str1, str2, key, negative, enum=10, maxlen=400):
 
             # get residue RSA
             res_rsa = max(residue.sasa, 1)/max_asa[rid]
+            
+            # skip buried residues
+            if res_rsa < 0.2: continue
+            
             masks.append(res_rsa)
 
             # get residue 1-hot
@@ -78,27 +76,6 @@ def format_data(code, str1, str2, key, negative, enum=10, maxlen=400):
         print (f'One empty/too long struct. in {code}')
         return [code, None]
 
-#    # compute distance maps
-#    cloud1, cloud2 = CA_pair
-#    cmap1 = distances_from_cloud(cloud1[:,None,:], cloud1[None,:,:])
-#    cmap2 = distances_from_cloud(cloud2[:,None,:], cloud2[None,:,:])
-#
-#    # compute, pad and encode intra-chain edges
-#    local1, local2 = local_pair
-#    edges1, senders1, receivers1 = get_edges(cmap1, local1, local1, cloud1, cloud1, enum)
-#    edges2, senders2, receivers2 = get_edges(cmap2, local2, local2, cloud2, cloud2, enum)
-#
-#    # compute , pad and encode ground truth inter-chain edges 
-#    icmap = distances_from_cloud(cloud1[:,None,:], cloud2[None,:,:])
-#    ledges12, lsenders12, lreceivers12 = get_edges(icmap, local1, local2, cloud1, cloud2, enum)
-#    
-#    icmap = jnp.transpose(icmap)
-#    ledges21, lsenders21, lreceivers21 = get_edges(icmap, local2, local1, cloud2, cloud1, enum) 
-#
-#    ledges = jnp.concatenate((ledges12, ledges21), axis=0)
-#    lsenders = jnp.concatenate((lsenders12, lsenders21), axis=0)
-#    lreceivers = jnp.concatenate((lreceivers12, lreceivers21), axis=0)
-#
 #    # sanity check on negatome examples not having contacts
 #    if jnp.max(icmap) <= 8 and negative:
 #        print (f'Existing interface in negative example: {code}')
@@ -125,71 +102,87 @@ def format_data(code, str1, str2, key, negative, enum=10, maxlen=400):
                    'nodes':nodes_pair}]
     
 
-def plot_dataset_stats(dataset, subset_paths):
-    data = {'pairsize':[], 'rec.size':[], 'lig.size':[], 
-            'icontacts6':[], 'icontacts8':[], 'set':[]}
+def plot_dataset_stats(subset_paths, config):
+    data = {'rec_size':[], 'lig_size':[], 
+            'rec_size_acc':[], 'lig_size_acc':[]}
 
     for subset_path in subset_paths:
-        subset_id = subset_path.split('/')[-2]
-        paths = [line.rstrip() for line in glob.glob(subset_path)]
-        codes = [path.split('/')[-1].strip('_r_b.pdb').upper() for path in paths]
-        for code in codes:
-            if code not in dataset: continue
-            data['rec.size'].append(dataset[code]['clouds'][0].shape[0])
-            data['lig.size'].append(dataset[code]['clouds'][1].shape[0])
-            data['pairsize'].append(
-                dataset[code]['clouds'][0].shape[0]+
-                dataset[code]['clouds'][1].shape[0])
-            data['icontacts6'].append(int(jnp.sum(jnp.where(dataset[code]['interface']<=6, 1, 0))))
-            data['icontacts8'].append(int(jnp.sum(jnp.where(dataset[code]['interface']<=8, 1, 0))))
-            data['set'].append(subset_id)
+        for idx, path in enumerate(glob.glob(subset_path+'/*')):
+            with open(path, 'rb') as f: feats = pkl.load(f)
+            #subset_id = subset_path.split('/')[-2]
+            rec_ca = jnp.argwhere(feats['masks'][0]!=0)
+            lig_ca = jnp.argwhere(feats['masks'][1]!=0)
+            rec_ca_acc = jnp.argwhere(feats['masks'][0]>=0.2)
+            lig_ca_acc = jnp.argwhere(feats['masks'][1]>=0.2)
+            data['rec_size'].append(rec_ca.shape[0])
+            data['lig_size'].append(lig_ca.shape[0])
+            data['rec_size_acc'].append(rec_ca_acc.shape[0])
+            data['lig_size_acc'].append(lig_ca_acc.shape[0])
+            #rec_coord = dataset[code]['clouds'][0][rec_ca] 
+            #lig_coord = dataset[code]['clouds'][1][lig_ca]
+            #dmap = distances_from_coords(rec_coord[:,None,:], lig_coord[None,:,:])
+    
+            #rec_coord_acc = dataset[code]['clouds'][0][rec_ca_acc]
+            #lig_coord_acc = dataset[code]['clouds'][1][lig_ca_acc]
+            #dmap_acc = distances_from_coords(rec_coord_acc[:,None,:], lig_coord_acc[None,:,:])
+    
+            #data['icontacts'].append(int(jnp.sum(jnp.where(dmap<=config['interface_threshold'], 1, 0))))
+            #data['icontacts_acc'].append(int(jnp.sum(jnp.where(dmap<=config['interface_threshold'], 1, 0))))
+            #data['set'].append(subset_id)
 
-    f, ax = plt.subplots(2,2)
+    f, ax = plt.subplots(2,1)
     f.tight_layout(pad=2.0)
     data = pd.DataFrame(data)
-    sb.kdeplot(x='rec.size', y='lig.size', data=data, hue='set', legend=False, ax=ax[0][0])
-    sb.histplot(x='pairsize', data=data, hue='set', fill=False, ax=ax[0][1])
-    sb.scatterplot(x='pairsize', y='icontacts6', data=data, hue='set', s=3, legend=False, ax=ax[1][0])
-    sb.scatterplot(x='pairsize', y='icontacts8', data=data, hue='set', s=3, legend=False, ax=ax[1][1])
-    ax[1][0].set_ylim([0, 200])
-    ax[1][1].set_ylim([0, 200])
+    sb.scatterplot(x='rec_size', y='lig_size', data=data, legend=False, ax=ax[0])
+    sb.scatterplot(x='rec_size_acc', y='lig_size_acc', data=data, legend=False, ax=ax[1])
+    #sb.scatterplot(x='pairsize', y='icontacts6', data=data, hue='set', s=3, legend=False, ax=ax[1][0])
+    #sb.scatterplot(x='pairsize', y='icontacts8', data=data, hue='set', s=3, legend=False, ax=ax[1][1])
+    #ax[1][0].set_ylim([0, 200])
+    #ax[1][1].set_ylim([0, 200])
     plt.savefig('datasets.png')
 
 def main():
     pdbp = PDBParser(QUIET=True)
     cifp = MMCIFParser(QUIET=True)
 
-    b5_path = '/home/pozzati/complex_assembly/data/benchmark5.5/*_r_b.pdb'
-    neg_path = '/home/pozzati/complex_assembly/data/negatome/*_r_b.pdb'
-    output_path = '/home/pozzati/complex_assembly/data/dataset_features/'
+    path = os.getcwd()+'/'+'/'.join(__file__.split('/')[:-2])
+
+    with open(path+'/src/config.json') as j: config = json.load(j)
+
+    b5_path = f'{path}/data/benchmark5.5/*_r_b.pdb'
+    neg_path = f'{path}/data/negatome/*_r_b.pdb'
+    output_path = f'{path}/data/dataset_features/'
     pos_path_list = [line.rstrip() for line in glob.glob(b5_path)]
     neg_path_list = [line.rstrip() for line in glob.glob(neg_path)]
-    path_list = pos_path_list+neg_path_list
+    path_list = pos_path_list #+neg_path_list
 
-    key = jax.random.PRNGKey(46)
+    key = jax.random.PRNGKey(config['random_seed'])
 
     for path in path_list:
         path2 = path[:-7]+'l'+path[-6:]
         code = path.split('/')[-1].strip('_r_b.pdb').upper()
-        print ('loading')
         rec = pdbp.get_structure('', path)
         lig = pdbp.get_structure('', path2)
-        print ('formatting')
         key, key1 = jax.random.split(key)
-        formatted_data = format_data(code, rec, lig, key1, path in neg_path_list)
+        formatted_data = format_data(
+                code, rec, lig, key1, 
+                path in neg_path_list, 
+                maxlen=config['padding'])
 
         if not formatted_data[1]: continue
         with open(output_path+code+'.pkl', 'wb') as out:
             pickle.dump(formatted_data[1], out)
 
 def main2():
-    b5_path = '/home/pozzati/complex_assembly/data/benchmark5.5/*_r_b.pdb'
-    neg_path = '/home/pozzati/complex_assembly/data/negatome/*_r_b.pdb'
-    output_path = '/home/pozzati/complex_assembly/data/train_features.pkl'
-    with open(output_path, 'rb') as data:
-        dataset = pickle.load(data)
+    
+    path = os.getcwd()+'/'+'/'.join(__file__.split('/')[:-2])
+    with open(path+'/src/config.json') as j: config = json.load(j)
 
-    plot_dataset_stats(dataset, [b5_path, neg_path])
+    b5_path = f'{path}/data/dataset_features'
+    #neg_path = f'{path}/data/negatome/*_r_b.pdb'
+
+    plot_dataset_stats([b5_path], config)#, neg_path])
 
 if __name__ == '__main__':
     main()
+    #main2()
