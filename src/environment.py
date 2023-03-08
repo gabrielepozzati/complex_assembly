@@ -278,7 +278,7 @@ class DockingEnv():
             clash_mask = jnp.where((dmap<=c_thr)&(dmap!=0), 1, 0)
             clash_count = jnp.sum(clash_mask)
 
-            # clash entity
+            # clash amount
             #sig_min, sig_max = jax.nn.sigmoid(-(c_thr/2)), jax.nn.sigmoid((c_thr/2))
             #c_scaling = lambda x: (jax.nn.sigmoid(x-(c_thr/2))-sig_min)/(sig_max-sig_min)
             #c_val = c_scaling(dmap)
@@ -286,7 +286,7 @@ class DockingEnv():
             #c_val *= interface_mask
 
             # clash scaling factor
-            c_scaling = jax.nn.sigmoid(jnp.log(interface_count/clash_count+1e-6))
+            c_scaling = jax.nn.sigmoid(jnp.log(interface_count+1e-6/2*(clash_count)+1e-6))
 
             # count of real interface residues
             real_interface_mask = jnp.where((dmap_true<=d_thr)&(dmap_true!=0), 1, 0)
@@ -294,7 +294,7 @@ class DockingEnv():
 
             # max contribution per real interface residue
             d_max = self.config['max_reward']/(real_interface_count)
-
+            
             # delta distance scaled contribution
             d_val = jnp.abs(jnp.subtract(dmap, dmap_true))
             sig_max = jax.nn.sigmoid(0)
@@ -303,7 +303,15 @@ class DockingEnv():
             d_val *= d_max
 
             return jnp.sum(d_val)*c_scaling, jnp.sum(d_val), c_scaling
-         
+        
+        #a_s, b_s, c_s = [], [], []
+        #for x, y in zip(dmaps, self.true_ints):
+        #    a, b, c = _get_reward(x,y)
+        #    a_s.append(a)
+        #    b_s.append(b)
+        #    c_s.append(c)
+        #return jnp.stack(a_s), jnp.stack(b_s), jnp.stack(c_s)
+        
         return vmap(_get_reward)(dmaps, self.true_ints)
 
     def move_from_native(self, key, reset_idxs, deviation):

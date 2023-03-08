@@ -239,19 +239,20 @@ if __name__ == "__main__":
             actor_state, critic_state,
             masks_P, nodes_P, edges_P, i_P, j_P):
     
-        def actor_loss_fn(params):
+        def actor_loss_fn(params, c_params):
             params = params_cast(params)
-            actions = actor.apply(params, None,
+            actions = a_apply(params, None,
                     masks_P, nodes_P, edges_P, i_P, j_P)
 
-            c_params = params_cast(critic_state.params)
-            q = critic.apply(c_params, None,
+            c_params = params_cast(c_params)
+            q = c_apply(c_params, None,
                     masks_P, nodes_P, edges_P, i_P, j_P, actions)
 
             return get_mean(q)
 
         # compute actor gradients
-        actor_loss, grads = jax.value_and_grad(actor_loss_fn)(actor_state.params)
+        actor_loss, grads = jax.value_and_grad(actor_loss_fn)(
+                actor_state.params, critic_state.params)
         
         # update actor online parameters
         actor_state = update_actor_params(grads, actor_state)
@@ -331,6 +332,7 @@ if __name__ == "__main__":
                 mask_ints_N, edge_ints_N, i_ints_N, j_ints_N,
                 actions, rewards]
 
+        sg = time.time()
         # buffer update
         if global_step <= config['buffer_size'] \
         and r_buffer.cache_actual < r_buffer.cache_size:
@@ -363,7 +365,10 @@ if __name__ == "__main__":
             # update buffer with example
             r_buffer.buff, _ = \
                 r_buffer.add_experience(r_buffer.buff, experience, r_buffer.buff_actual)
+        
+        print (f'Buffer update done! - {time.time()-sg}')
 
+        sg = time.time()
         # update state for next iteration
         mask_ints = mask_ints_N
         edge_ints = edge_ints_N
@@ -377,7 +382,6 @@ if __name__ == "__main__":
         
         reset_idxs = get_illegal_idxs(dmaps, config, reset=pair_reset_count)
         
-
         # reset selected pairs
         if len(reset_idxs) != 0:
             for n in reset_idxs:
@@ -390,7 +394,9 @@ if __name__ == "__main__":
             last_iter_reset = reset_idxs
 
         else: last_iter_reset = []
+        print (f'Reset done! - {time.time()-sg}')
 
+        sg = time.time()
         ############# save deltas ###############
         delta_rewards = rewards - old_rewards
         delta_rmsds = rmsds - old_rmsds
@@ -405,11 +411,13 @@ if __name__ == "__main__":
         old_rmsds = rmsds
         old_rewards = rewards
         #########################################
+        print (f'debug done! - {time.time()-sg}')
 
         # network updates
         if global_step+1 > config['buffer_size'] \
         and (global_step+1) % config['update_frequency'] == 0:
-
+            
+            # sample example batch
             key, nkey = jrn.split(key, 2)
             batch, pair_idxs = r_buffer.sample_from_buffer(nkey, r_buffer.buff)    
             batch = [jax.device_put(array, device=gpus[1]) for array in batch]
@@ -419,6 +427,7 @@ if __name__ == "__main__":
              mask_ints_N, edge_ints_N, i_ints_N, j_ints_N,
              actions, rewards) = batch
 
+            # format batch
             bs, ps = config['batch_size_num'], pmap_maxsize
             masks_P, nodes_P, edges_P, i_P, j_P = envs.format_input_state(
                     mask_ints_P, edge_ints_P, i_ints_P, j_ints_P, pair_idxs, bs, ps)
@@ -431,28 +440,24 @@ if __name__ == "__main__":
             actions = jnp.reshape(actions, new_shape)
             new_shape = (ps, int(bs*bp/ps),)
             rewards = jnp.reshape(rewards, new_shape)
-
+            
             # update critic parameters
             critic_state, crit_loss = update_critic(
                     actor_state, critic_state,
                     masks_P, nodes_P, edges_P, i_P, j_P,
                     masks_N, nodes_N, edges_N, i_N, j_N,
                     actions, rewards)
-            print (f'Updated critic! - {time.time()-sg}')
-            sg = time.time()
-
+            
             # update actor and target nets parameters
             actor_state, critic_state, actor_loss_value = update_actor(
                     actor_state, critic_state,
                     masks_P, nodes_P, edges_P, i_P, j_P)
-            print (f'Updated actor! - {time.time()-sg}')
-            sg = time.time()
 
             # store rewards
             loss_series.append(crit_loss)
             mean_reward = jnp.mean(rewards)
             reward_series.append(mean_reward)
-            print (f'\n\nCritic loss:{crit_loss}, Reward: {mean_reward}\n\n')
+            print (f'\nCritic loss:{crit_loss}, Reward: {mean_reward}')
 
     loss_series = list(np.array(loss_series))
     reward_series = list(np.array(reward_series))
