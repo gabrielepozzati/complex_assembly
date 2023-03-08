@@ -10,6 +10,7 @@ import pickle as pkl
 import seaborn as sb
 import matplotlib.pyplot as plt
 from functools import partial
+from gpuinfo.nvidia import get_gpus
 from distutils.util import strtobool
 from typing import Sequence, Iterable, Mapping, NamedTuple, Tuple
 
@@ -23,13 +24,20 @@ from jax import tree_util
 from jraph import GraphsTuple
 from networks.critic import Critic
 from networks.actor import Actor
-from networks.updates import *
 from replay_buffer import *
 from environment import *
 from ops import *
 
 from Bio.PDB import PDBIO, PDBParser
 from Bio.PDB.Structure import Structure
+
+def actor_fw(mask, nodes, edges, i, j):
+    actor = Actor(config)
+    return actor(mask, nodes, edges, i, j)
+
+def critic_fw(mask, nodes, edges, i, j, action):
+    critic = Critic(config)
+    return critic(mask, nodes, edges, i, j, action)
 
 class TrainState(NamedTuple):
     params: hk.Params
@@ -38,68 +46,79 @@ class TrainState(NamedTuple):
 
 if __name__ == "__main__":    
     
+    ####################################################
+    # DATA READING
+    ####################################################
+
+    # load config and dataset
     path = os.getcwd()+'/'+'/'.join(__file__.split('/')[:-2])
 
     s = time.time()
     with open(path+'/src/config.json') as j: config = json.load(j)
 
-    dataset, code = load_dataset(path+'/data/dataset_features/', size=2)
-    test, test_code = load_dataset(path+'/data/dataset_features/', size=1, skip=2)
+    d_size, td_size = config['training_pairs'], config['test_pairs']
+    dataset, code = load_dataset(path+'/data/dataset_features/', size=d_size)
+    test, test_code = load_dataset(path+'/data/dataset_features/', size=td_size, skip=d_size)
 
-    io = PDBIO()
-    pdbp = PDBParser(QUIET=True)
-    test_code = test_code.upper()
-    rpath = f'{path}/data/benchmark5.5/{test_code}_r_b.pdb'
-    lpath = f'{path}/data/benchmark5.5/{test_code}_l_b.pdb'
+    ####################################################
+    # ENVIRONMENTS INITIALIZATION
+    ####################################################
     
-    out_struc = Structure('test')
-
-    # save structures of starting models
-#    rstruc = pdbp.get_structure('', rpath)
-#    cm = jnp.array(test[test_code]['init_rt'][0][0])
-#    quat = jnp.array(test[test_code]['init_rt'][0][1])
-#    out_struc = save_to_model(out_struc, rstruc[0], quat, cm, init=True)
-
-#    lstruc = pdbp.get_structure('', lpath)
-#    cm = jnp.array(test[test_code]['init_rt'][1][0])
-#    quat = jnp.array(test[test_code]['init_rt'][1][1])
-#    out_struc = save_to_model(out_struc, lstruc[0], quat, cm, init=True)
-
     # devices
     cpus = jax.devices('cpu')
     gpus = jax.devices('gpu')
-    #os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+    pmap_maxsize, pmap_devices = get_pmap_details()
 
     # seeding
     random.seed(config['random_seed'])
     key = jrn.PRNGKey(config['random_seed'])
-    key, env_key, buff_key = jrn.split(key, 3)
-    key, act_key, crit_key = jrn.split(key, 3)
+    key, akey, ckey = jrn.split(key, 3)
 
     # environment setup
-    envs = DockingEnv(dataset, 10, 400, env_key)
-    tenvs = DockingEnv(test, 10, 400, env_key)
+    envs = DockingEnv(dataset, config)
+    tenvs = DockingEnv(test, config)
     
+    # get a formatted state of training data to init parameters
+    (mask_ints, edge_ints, i_ints, j_ints) = envs.get_state(envs.coord_ligs)
+
+    ps = pmap_maxsize
+    all_idxs = jnp.indices((envs.number,))[0]
+    (mask, nodes, edges, i, j) = \
+            envs.format_input_state(
+                    mask_ints, edge_ints, i_ints, j_ints, all_idxs, 1, 1)
+
     # replay buffer setup
     r_buffer = ReplayBuffer(config, envs.list)
+
+    ####################################################
+    # TRAINING OBJECTS INITIALIZATION
+    ####################################################
 
     # actor/critic models setup
     actor = hk.transform(actor_fw)
     critic = hk.transform(critic_fw)
-    a_apply = jax.jit(actor.apply)
-    c_apply = jax.jit(critic.apply)
    
-    (mask_ints, edge_ints, i_ints, j_ints) = envs.get_state(envs.coord_ligs)
+    # single action agent compile
+    a_apply_s = jax.jit(actor.apply)
 
-    (mask, nodes, edges, i, j) = \
-            envs.format_input_state(mask_ints, edge_ints, i_ints, j_ints)
+    # batch-splitting multi-GPU agent compile
+    a_apply = jax.pmap(actor.apply, 
+            devices=pmap_devices)
+
+    # batch-splitting multi-GPU critic compile
+    c_apply = jax.pmap(critic.apply,
+            devices=pmap_devices)
 
     # actor parameters initialization
-    a_params = actor.init(act_key, mask, nodes, edges, i, j)
-
+    a_params = actor.init(akey, 
+            mask[0], nodes[0], edges[0], i[0], j[0])
+    
     # critic parameters initialization
-    action = a_apply(a_params, None, mask, nodes, edges, i, j)
-    c_params = critic.init(crit_key, mask, nodes, edges, i, j, action)
+    action = a_apply_s(a_params, None, 
+            mask[0], nodes[0], edges[0], i[0], j[0])
+
+    c_params = critic.init(ckey, 
+            mask[0], nodes[0], edges[0], i[0], j[0], action)
 
     # duplicate and group actor/critic params, init optimizer
     a_optimiser = optax.adam(learning_rate=config['learning_rate'])
@@ -115,21 +134,154 @@ if __name__ == "__main__":
         target_params=c_params,
         opt_state=c_optimiser.init(c_params))
 
-    print ('Initialization completed! -', time.time()-s)
+    ####################################################
+    # TRAINING SET THRESHOLD RANDOMIZATION
+    ####################################################
 
     # move ligands from native pose
-    all_idxs = jnp.indices((envs.number,))[0]
-    key, n_key = jrn.split(key, 2)
-    envs.move_from_native(n_key, all_idxs, 10, config)
+    key, nkey = jrn.split(key, 2)
+    original = envs.coord_ligs
+    envs.move_from_native(nkey, all_idxs, config['native_dev'])
     
+    dmaps = vmap(distances_from_coords)(
+                envs.coord_recs[:,:,None,:], envs.coord_ligs[:,None,:,:])
+    dmaps = vmap(lambda x,y,z: x*y[:,None]*z[None,:])(
+                dmaps, envs.padmask_recs, envs.padmask_ligs)
+    old_rewards, _, _ = envs.get_rewards(dmaps)
+
+    rmsd = vmap(rmsd)
+    old_rmsds = rmsd(original, envs.coord_ligs, envs.length_ligs)
+
     # get state
     (mask_ints, edge_ints, i_ints, j_ints) = envs.get_state(envs.coord_ligs)
 
-    # training iteration
+    print ('Initialization completed! -', time.time()-s)
+
+    ###########################################################
+    # UPDATE ACCESSORY FUNCTIONS
+    ###########################################################
+
+    # function to broadcast parameters to GPU number
+    params_cast = jax.jit(partial(
+            jax.tree_util.tree_map, lambda x: jnp.stack([x]*ps)))
+
+    # function to compute mean squared error and mean
+    get_mse = jax.jit(
+            lambda x, y: jnp.mean((y - jnp.ravel(x))**2))
+
+    get_mean = jax.jit(lambda x: jnp.mean(-x))
+
+    # function to compute target q value
+    get_target_reward = jax.jit(
+            lambda x, y: jnp.ravel(x) + (config['gamma']*jnp.ravel(y)))
+
+    # function to update parameters
+    @jax.jit
+    def update_actor_params(grads, state):
+        updates, new_opt_state = a_optimiser.update(grads, state.opt_state)
+        return state._replace(
+                params=optax.apply_updates(state.params, updates),
+                opt_state=new_opt_state)
+    
+    @jax.jit
+    def update_critic_params(grads, state):
+        updates, new_opt_state = c_optimiser.update(grads, state.opt_state)
+        return state._replace(
+                params=optax.apply_updates(state.params, updates),
+                opt_state=new_opt_state)
+
+    ##########################################################
+    # UPDATE CRITIC FUNCTION
+    ##########################################################
+
+    # function to update critic online neural network
+    def update_critic(
+            actor_state, critic_state,
+            masks_P, nodes_P, edges_P, i_P, j_P,
+            masks_N, nodes_N, edges_N, i_N, j_N,
+            actions, rewards):
+
+        # critic neural network loss function
+        def crit_loss_fn(params):    
+            params = params_cast(params)
+            q = c_apply(params, None,
+                    masks_P, nodes_P, edges_P, i_P, j_P, actions)
+
+            return get_mse(q, y)
+
+        # broadcast target net parameters to GPU number
+        a_params = params_cast(actor_state.target_params)
+        c_params = params_cast(critic_state.target_params)
+        
+        # compute next-step q value
+        actions = a_apply(a_params, None,
+                masks_N, nodes_N, edges_N, i_N, j_N)
+
+        next_q = c_apply(c_params, None,
+                masks_N, nodes_N, edges_N, i_N, j_N, actions)
+
+        # compute target rewards
+        y = get_target_reward(rewards, next_q)
+        
+        # compute critic gradients
+        crit_loss, grads = jax.value_and_grad(crit_loss_fn)(critic_state.params)
+        
+        # update critic online parameters
+        critic_state = update_critic_params(grads, critic_state)
+
+        return critic_state, crit_loss
+
+    ##############################################################
+    # UPDATE ACTOR AND TARGET NETWORK FUNCTION
+    ##############################################################
+
+    def update_actor(
+            actor_state, critic_state,
+            masks_P, nodes_P, edges_P, i_P, j_P):
+    
+        def actor_loss_fn(params):
+            params = params_cast(params)
+            actions = actor.apply(params, None,
+                    masks_P, nodes_P, edges_P, i_P, j_P)
+
+            c_params = params_cast(critic_state.params)
+            q = critic.apply(c_params, None,
+                    masks_P, nodes_P, edges_P, i_P, j_P, actions)
+
+            return get_mean(q)
+
+        # compute actor gradients
+        actor_loss, grads = jax.value_and_grad(actor_loss_fn)(actor_state.params)
+        
+        # update actor online parameters
+        actor_state = update_actor_params(grads, actor_state)
+    
+        # update target parameters
+        actor_state = actor_state._replace(
+            target_params=optax.incremental_update(
+                actor_state.params,
+                actor_state.target_params,
+                config['tau']))
+    
+        critic_state = critic_state._replace(
+            target_params=optax.incremental_update(
+                critic_state.params,
+                critic_state.target_params,
+                config['tau']))
+    
+        return actor_state, critic_state, actor_loss  
+
+    ###########################################################
+    # TRAINING CYCLE
+    ###########################################################
+
     sg = time.time()
     loss_series = []
     reward_series = []
-    rewards_episode = []
+    last_iter_reset = []
+    delta_series = {'labels':[], 'rmsds':[], 'rewards':[]}
+    pair_reset_count = jnp.empty((envs.number,))
+    
     print ('Start training! - Filling buffer...')
     for global_step in range(config['steps']):
         
@@ -139,27 +291,35 @@ if __name__ == "__main__":
 
         # format state
         (masks, nodes, edges, i, j) = \
-                envs.format_input_state(mask_ints, edge_ints, i_ints, j_ints)
+                envs.format_input_state(
+                        mask_ints, edge_ints, i_ints, j_ints, all_idxs, 1, 1)
 
         # generate agent action
-        actions = partial(a_apply, a_params, None)(masks, nodes, edges, i, j)
+        a_params = actor_state.params
+        actions = a_apply_s(actor_state.params, None, 
+                masks[0], nodes[0], edges[0], i[0], j[0])
+        actions = jnp.squeeze(actions)
+
+        # elaborate action to apply to environment
         actions_t = vmap(lambda x: jnp.argmax(x, axis=1))(actions)
         Ps, p1s, p2s = envs.refine_action(envs.coord_ligs, actions_t)
-        quats = vmap(quat_from_pivoting)(Ps, p1s, p2s)      
+        quats = vmap(quat_from_pivoting)(Ps, p1s, p2s)
 
         ### add noise to action
 
         # apply action
-        envs.coord_ligs = envs.step(envs.coord_ligs, Ps, quats)
-        
+        coord_ligs = envs.step(envs.coord_ligs, Ps, quats)
+        rmsds = rmsd(coord_ligs, envs.coord_ligs, envs.length_ligs)
+        envs.coord_ligs = coord_ligs
+
         dmaps = vmap(distances_from_coords)(
                 envs.coord_recs[:,:,None,:], envs.coord_ligs[:,None,:,:])
         dmaps = vmap(lambda x,y,z: x*y[:,None]*z[None,:])(
                 dmaps, envs.padmask_recs, envs.padmask_ligs)
         
         # get reward for last action
-        rewards = envs.get_rewards(dmaps)
-        rewards_episode.append(rewards)
+        rewards, d_r, c_r = envs.get_rewards(dmaps)
+        #print ('Full',rewards,'distance',d_r,'clashes',c_r)
 
         # get new state
         (mask_ints_N, edge_ints_N, i_ints_N, j_ints_N) = envs.get_state(envs.coord_ligs)
@@ -171,11 +331,15 @@ if __name__ == "__main__":
                 mask_ints_N, edge_ints_N, i_ints_N, j_ints_N,
                 actions, rewards]
 
-        # fast storage into a reduced size cache on GPU
-        r_buffer.cache, r_buffer.cache_actual = \
-                r_buffer.add_to_cache(r_buffer.cache, experience, r_buffer.cache_actual)
-        
-        if r_buffer.cache_actual == r_buffer.cache_size:
+        # buffer update
+        if global_step <= config['buffer_size'] \
+        and r_buffer.cache_actual < r_buffer.cache_size:
+            # fast storage into a reduced size cache on GPU
+            r_buffer.cache, r_buffer.cache_actual = \
+                    r_buffer.add_experience(r_buffer.cache, experience, r_buffer.cache_actual)
+
+        elif global_step <= config['buffer_size'] \
+        and r_buffer.cache_actual == r_buffer.cache_size:
             
             # when cache is full move it to CPU
             r_buffer.cache = jax.device_put(r_buffer.cache, device=jax.devices('cpu')[0])
@@ -191,6 +355,15 @@ if __name__ == "__main__":
             r_buffer.buff_actual = min(buff_actual, r_buffer.buff_size)
             r_buffer.cache_actual = 0
 
+        elif global_step > config['buffer_size']:
+
+            # move experience to CPU
+            experience = jax.device_put(experience, device=jax.devices('cpu')[0])
+            
+            # update buffer with example
+            r_buffer.buff, _ = \
+                r_buffer.add_experience(r_buffer.buff, experience, r_buffer.buff_actual)
+
         # update state for next iteration
         mask_ints = mask_ints_N
         edge_ints = edge_ints_N
@@ -198,89 +371,152 @@ if __name__ == "__main__":
         j_ints = j_ints_N
 
         # check reset conditions
-        if illegal_interfaces(dmaps, config, True):
-            reset_idxs = get_illegal_idxs(dmaps, config)
-            print ('To reset: ', reset_idxs)
-            envs.reset(dataset, reset_idxs)
+        for n in range(envs.number):
+            increment = pair_reset_count[n]+1
+            pair_reset_count = pair_reset_count.at[n].set(increment)
+        
+        reset_idxs = get_illegal_idxs(dmaps, config, reset=pair_reset_count)
+        
 
-            key, n_key = jrn.split(key, 2)
-            envs.move_from_native(n_key, reset_idxs, 10, config)
+        # reset selected pairs
+        if len(reset_idxs) != 0:
+            for n in reset_idxs:
+                pair_reset_count = pair_reset_count.at[n].set(0)
+            
+            #print ('To reset: ', reset_idxs)
+            envs.reset(dataset, reset_idxs)
+            key, nkey = jrn.split(key, 2)
+            envs.move_from_native(nkey, reset_idxs, config['native_dev'])
+            last_iter_reset = reset_idxs
+
+        else: last_iter_reset = []
+
+        ############# save deltas ###############
+        delta_rewards = rewards - old_rewards
+        delta_rmsds = rmsds - old_rmsds
+        delta_rewards = jnp.ravel(delta_rewards)
+        delta_rmsds = jnp.ravel(delta_rmsds)
+        for n in range(rewards.shape[0]):
+            if n in last_iter_reset: continue
+            delta_series['rewards'].append(float(delta_rewards[n]))
+            delta_series['rmsds'].append(float(delta_rmsds[n]))
+            delta_series['labels'].append(envs.list[n])
+
+        old_rmsds = rmsds
+        old_rewards = rewards
+        #########################################
 
         # network updates
         if global_step+1 > config['buffer_size'] \
-        and (global_step+1) % config['policy_frequency'] == 0:
+        and (global_step+1) % config['update_frequency'] == 0:
 
-            key, pkey = jrn.split(key, 2)
+            key, nkey = jrn.split(key, 2)
+            batch, pair_idxs = r_buffer.sample_from_buffer(nkey, r_buffer.buff)    
+            batch = [jax.device_put(array, device=gpus[1]) for array in batch]
+            pair_idxs = jax.device_put(pair_idxs, device=gpus[1])
 
-            # select a number of protein pairs 
-            batch_pair_idx = jrn.choice(
-                    pkey, envs.number, shape=(args.batch_pair_num,), replace=False)
+            (mask_ints_P, edge_ints_P, i_ints_P, j_ints_P,
+             mask_ints_N, edge_ints_N, i_ints_N, j_ints_N,
+             actions, rewards) = batch
 
-            # get corresponding codes
-            batch_pair_codes = [envs.list[idx] for idx in batch_pair_idx]
-                
-            # group buffers for each pair code
-            prot_buffers = [r_buffer.buffer[code] for code in batch_pair_codes]
+            bs, ps = config['batch_size_num'], pmap_maxsize
+            masks_P, nodes_P, edges_P, i_P, j_P = envs.format_input_state(
+                    mask_ints_P, edge_ints_P, i_ints_P, j_ints_P, pair_idxs, bs, ps)
 
-            # extract batch
-            batch, r_buffer.key = r_buffer.sample_from_replay(
-                    args.batch_size, prot_buffers, r_buffer.key)    
-            batch = jax.device_put(batch, device=gpus[0])
+            masks_N, nodes_N, edges_N, i_N, j_N = envs.format_input_state(
+                    mask_ints_N, edge_ints_N, i_ints_N, j_ints_N, pair_idxs, bs, ps)
+            
+            bp = len(pair_idxs)
+            new_shape = (ps, int(bs*bp/ps),) + actions.shape[-2:]
+            actions = jnp.reshape(actions, new_shape)
+            new_shape = (ps, int(bs*bp/ps),)
+            rewards = jnp.reshape(rewards, new_shape)
 
             # update critic parameters
             critic_state, crit_loss = update_critic(
-                    actor_state, critic_state, batch, batch_pair_idx)
+                    actor_state, critic_state,
+                    masks_P, nodes_P, edges_P, i_P, j_P,
+                    masks_N, nodes_N, edges_N, i_N, j_N,
+                    actions, rewards)
+            print (f'Updated critic! - {time.time()-sg}')
+            sg = time.time()
 
             # update actor and target nets parameters
             actor_state, critic_state, actor_loss_value = update_actor(
-                    actor_state, critic_state, batch, batch_pair_idx)
+                    actor_state, critic_state,
+                    masks_P, nodes_P, edges_P, i_P, j_P)
+            print (f'Updated actor! - {time.time()-sg}')
+            sg = time.time()
 
             # store rewards
-            mean_reward = jnp.mean(jnp.array(rewards_episode))
-            rewards_episode = []
             loss_series.append(crit_loss)
+            mean_reward = jnp.mean(rewards)
             reward_series.append(mean_reward)
-            print (f'Completed episode {global_step+1} - {time.time()-sg}')
-            print (f'Critic loss:{crit_loss}, Reward: {mean_reward}')
+            print (f'\n\nCritic loss:{crit_loss}, Reward: {mean_reward}\n\n')
 
     loss_series = list(np.array(loss_series))
     reward_series = list(np.array(reward_series))
     step = list(range(len(loss_series)))
 
-    plt.figure()
-    data = {'steps':step, 'values':loss_series}
-    sb.lineplot(data=data, x='steps', y='values')
-    plt.savefig('loss.png')
+    data = {'steps':step, 'loss':loss_series, 'reward':reward_series}
+    
+    sb.violinplot(x='labels', y='rewards', data=delta_series)
+    plt.savefig('rewards.png')
+    sb.violinplot(x='labels', y='rmsds', data=delta_series)
+    plt.savefig('rmsds.png')
 
-    plt.figure()
-    data = {'steps':step, 'values':reward_series}
-    sb.lineplot(data=data, x='steps', y='values')
-    plt.savefig('reward.png')
+    g = sb.lineplot(data=data, x='steps', y='loss')
+    sb.lineplot(data=data, x='steps', y='reward', color='red', ax=g.axes.twinx())
+    plt.savefig('train.png')
 
-    for global_step in range(args.test_steps):
+    with open('params.pkl', 'wb') as out: pkl.dump(actor_state.params, out)
 
-        # get state
-        tenvs.edge_int, tenvs.send_int, tenvs.neigh_int = tenvs.get_state()
-
-        # get action
-        actions = vmap(partial(a_apply, a_params, None))(
-                tenvs.feat_rec, tenvs.feat_lig, tenvs.mask_rec, tenvs.mask_lig,
-                tenvs.edge_rec, tenvs.send_rec, tenvs.neigh_rec,
-                tenvs.edge_lig, tenvs.send_lig, tenvs.neigh_lig,
-                tenvs.edge_int, tenvs.send_int, tenvs.neigh_int,)
-
-        # apply action
-        dmaps, coord_lig = tenvs.step(tenvs.coord_rec, tenvs.coord_lig, actions)
-
-        tenvs.coord_lig = coord_lig
-        reward = tenvs.get_rewards(dmaps)
-
-        # apply action to full atom structure
-        out_models = unfold_entities(out_struc, 'M')
-        out_struc = save_to_model(out_struc, out_models[-1], actions[0,:4], actions[0,4:-1])
-        
-        print (f'Completed episode {global_step+1} - {time.time()-sg}')
-        print (f'Writing --- Reward: {reward}')
-
-    io.set_structure(out_struc)
-    io.save('test.pdb')
+    ####################################################
+    # INDEPENDENT TEST
+    ####################################################
+#
+#    io = PDBIO()
+#    pdbp = PDBParser(QUIET=True)
+#    test_code = test_code.upper()
+#    rpath = f'{path}/data/benchmark5.5/{test_code}_r_b.pdb'
+#    lpath = f'{path}/data/benchmark5.5/{test_code}_l_b.pdb'
+#
+#    
+#    out_struc = Structure('test')
+#
+#    # move test ligands from native
+#    all_idxs = jnp.indices((tenvs.number,))[0]
+#    key, nkey = jrn.split(key, 2)
+#    tenvs.move_from_native(nkey, all_idxs, config['native_dev'])
+#
+#    for global_step in range(config['test_steps']):
+#
+#        # get state
+#        (mask_ints, edge_ints, i_ints, j_ints) = tenvs.get_state(envs.coord_ligs)
+#        
+#        # format state
+#        (masks, nodes, edges, i, j) = \
+#                tenvs.format_input_state(
+#                        mask_ints, edge_ints, i_ints, j_ints, all_idxs, 1)
+#        # get action
+#        actions = partial(a_apply, a_params, None)(masks, nodes, edges, i, j)
+#        actions_t = vmap(lambda x: jnp.argmax(x, axis=1))(actions)
+#        Ps, p1s, p2s = tenvs.refine_action(tenvs.coord_ligs, actions_t)
+#        quats = vmap(quat_from_pivoting)(Ps, p1s, p2s)
+#
+#        # apply action and get reward
+#        tenvs.coord_ligs = tenvs.step(tenvs.coord_ligs, Ps, quats)
+#        dmaps = vmap(distances_from_coords)(
+#                tenvs.coord_recs[:,:,None,:], tenvs.coord_ligs[:,None,:,:])
+#        dmaps = vmap(lambda x,y,z: x*y[:,None]*z[None,:])(
+#                dmaps, tenvs.padmask_recs, tenvs.padmask_ligs)
+#        reward = tenvs.get_rewards(dmaps)
+#
+#        # apply action to full atom structure
+##        out_models = unfold_entities(out_struc, 'M')
+##        out_struc = save_to_model(out_struc, out_models[-1], Ps, quats)
+#        
+#        print (f'Writing --- Reward: {reward}')
+#
+#    io.set_structure(out_struc)
+   # io.save('test.pdb')

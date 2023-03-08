@@ -13,12 +13,12 @@ from ops import *
 from quaternions import *
 
 class DockingEnv():
-    def __init__(self, dataset, enum, pad, PNRG):
-        self.key = PNRG
-        self.size = pad
+    def __init__(self, dataset, config):
+        self.config = config
+        self.size = config['padding']
         self.list = list(dataset.keys())
         self.number = len(self.list)
-        self.edge_num = enum
+        self.edge_num = config['edge_number']
 
         def _extract_data(idx):
             CA = jnp.stack([dataset[pdb]['coord'][idx] for pdb in self.list])
@@ -28,6 +28,7 @@ class DockingEnv():
                 CA = jnp.expand_dims(CA, axis=0)
                 mask = jnp.expand_dims(mask, axis=0)
                 nodes = jnp.expand_dims(nodes, axis=0)
+
             return mask, nodes, CA
         
         def _get_dmaps(c_i, c_j, m_i, m_j):
@@ -64,7 +65,7 @@ class DockingEnv():
     def reset(self, dataset, idxs):
         '''
         Reset cloud informations for pairs whose index is in idxs. 
-        Cloud states are set back to what is stored in dataset.
+        Clpair_reset_count,oud states are set back to what is stored in dataset.
         '''
 
         ca_clouds = []
@@ -72,7 +73,6 @@ class DockingEnv():
             if idx in idxs: ca_clouds.append(dataset[code]['coord'][1])
             else: ca_clouds.append(self.coord_ligs[idx])
         self.coord_ligs = jnp.stack(ca_clouds)
-
 
     @partial(jax.jit, static_argnums=(0,1))
     def get_edges(self, edge_num, seqlen, dmap):
@@ -158,30 +158,49 @@ class DockingEnv():
         return mask_ints, edge_ints, send_ints, neigh_ints
 
 
-    @partial(jax.jit, static_argnums=(0,))
-    def format_input_state(self, masks, edges, senders, neighs):
+    @partial(jax.jit, static_argnums=(0,6,7))
+    def format_input_state(self, masks, edges, sends, neighs, idxs, bs, ps):
 
-        padmasks = jnp.concatenate((self.padmask_recs, 
-                                    self.padmask_ligs), axis=1)
+        size = self.size
+        enum = self.edge_num
+        bp = idxs.shape[0]
+        fs = int(bp*bs/ps)
 
-        masks = jnp.concatenate((padmasks[:,:,None], masks), axis=2)
-
-        nodes = jnp.concatenate((self.feat_recs, 
-                                 self.feat_ligs), axis=1)
+        padmasks = jnp.concatenate((self.padmask_recs, self.padmask_ligs), axis=1)
+        padmasks = padmasks[idxs][:,None,:,None]
+        padmasks =  jnp.broadcast_to(padmasks, (bp, bs, size*2, 1))
+        if len(masks.shape) < 4: masks = masks[:,None,:,:]
+        masks = jnp.concatenate((padmasks, masks), axis=3)
+        masks = jnp.reshape(masks, (ps, fs, size*2, 3))
         
-        edges = jnp.concatenate((self.edge_recs, 
-                                 self.edge_ligs, 
-                                 edges), axis=1)
-        
-        senders = jnp.concatenate((self.send_recs, 
-                                   self.send_ligs, 
-                                   senders), axis=1)
-        
-        neighs = jnp.concatenate((self.neigh_recs, 
-                                  self.neigh_ligs, 
-                                  neighs), axis=1)
 
-        return masks, nodes, edges, senders, neighs
+        nodes = jnp.concatenate((self.feat_recs, self.feat_ligs), axis=1)
+        nodes = nodes[idxs][:,None,:,:]
+        nodes = jnp.broadcast_to(nodes, (bp, bs, size*2, 22))
+        nodes = jnp.reshape(nodes, (ps, fs, size*2, 22))
+       
+        intra_edges = jnp.concatenate((self.edge_recs, self.edge_ligs), axis=1)
+        intra_edges = intra_edges[idxs][:,None,:,:]
+        intra_edges = jnp.broadcast_to(intra_edges, (bp, bs, size*enum*2, 15))
+        if len(edges.shape) < 4: edges = edges[:,None,:,:]
+        edges = jnp.concatenate((intra_edges, edges), axis=2)
+        edges = jnp.reshape(edges, (ps, fs, size*enum*4, 15))
+
+        intra_sends = jnp.concatenate((self.send_recs, self.send_ligs), axis=1)
+        intra_sends = intra_sends[idxs][:,None,:]
+        intra_sends = jnp.broadcast_to(intra_sends, (bp, bs, size*enum*2))
+        if len(sends.shape) < 3: sends = sends[:,None,:]
+        sends = jnp.concatenate((intra_sends, sends), axis=2)
+        sends = jnp.reshape(sends, (ps, fs, size*enum*4))
+
+        intra_neighs = jnp.concatenate((self.neigh_recs, self.neigh_ligs), axis=1)
+        intra_neighs = intra_neighs[idxs][:,None,:]
+        intra_neighs = jnp.broadcast_to(intra_neighs, (bp, bs, size*enum*2))
+        if len(neighs.shape) < 3: neighs = neighs[:,None,:]
+        neighs = jnp.concatenate((intra_neighs, neighs), axis=2)
+        neighs = jnp.reshape(neighs, (ps, fs, size*enum*4))
+
+        return masks, nodes, edges, sends, neighs
 
 
     @partial(jit, static_argnums=(0,))
@@ -247,29 +266,47 @@ class DockingEnv():
 
     @partial(jit, static_argnums=(0,))
     def get_rewards(self, dmaps):
-        def _get_reward(dmap, dmap_true, count):
-            thr = 3
-            d_val = jnp.abs(jnp.subtract(dmap, dmap_true))-3 # range 0<x<inf becomes -3<x<inf
-            c_val = jnp.where((dmap>=thr)|(dmap==0), 0, dmap)-(thr/2) # range 0<x<3 becomes -1.5<x<1.5
-            deltas = jax.nn.sigmoid(d_val*3)
-            clashes = jax.nn.sigmoid(c_val*6)
-            divisor = (4.5*deltas)+(4.5*clashes)
+        def _get_reward(dmap, dmap_true):
+            d_thr = self.config['interface_threshold']
+            c_thr = self.config['clash_threshold_rew']
+            
+            # count of interface residues
+            interface_mask = jnp.where((dmap<=d_thr)&(dmap!=0), 1, 0)
+            interface_count = jnp.sum(interface_mask)
+            
+            # count of clashes in interface
+            clash_mask = jnp.where((dmap<=c_thr)&(dmap!=0), 1, 0)
+            clash_count = jnp.sum(clash_mask)
 
-            interface_count = jnp.sum(jnp.where((dmap_true<=8)&(dmap_true!=0), 1, 0))
-            interface_max = 50/interface_count
-            int_scores = jnp.where(dmap_true<=8, interface_max, 0)
-            int_scores = int_scores/(1+divisor)
-            int_scores = jnp.where((dmap!=0)&(dmap_true<=8), int_scores, 0)
+            # clash entity
+            #sig_min, sig_max = jax.nn.sigmoid(-(c_thr/2)), jax.nn.sigmoid((c_thr/2))
+            #c_scaling = lambda x: (jax.nn.sigmoid(x-(c_thr/2))-sig_min)/(sig_max-sig_min)
+            #c_val = c_scaling(dmap)
+            #c_val = jnp.where(dmap>c_thr, 1, c_val)
+            #c_val *= interface_mask
 
-            all_max = 50/count
-            all_scores = all_max/(1+divisor)
-            all_scores = jnp.where(dmap!=0, all_scores, 0)
-            return jnp.sum(int_scores+all_scores)
+            # clash scaling factor
+            c_scaling = jax.nn.sigmoid(jnp.log(interface_count/clash_count+1e-6))
+
+            # count of real interface residues
+            real_interface_mask = jnp.where((dmap_true<=d_thr)&(dmap_true!=0), 1, 0)
+            real_interface_count = jnp.sum(real_interface_mask)
+
+            # max contribution per real interface residue
+            d_max = self.config['max_reward']/(real_interface_count)
+
+            # delta distance scaled contribution
+            d_val = jnp.abs(jnp.subtract(dmap, dmap_true))
+            sig_max = jax.nn.sigmoid(0)
+            d_val = jax.nn.sigmoid(-d_val)/sig_max
+            d_val *= real_interface_mask
+            d_val *= d_max
+
+            return jnp.sum(d_val)*c_scaling, jnp.sum(d_val), c_scaling
          
-        count = self.length_recs*self.length_ligs
-        return vmap(_get_reward)(dmaps, self.true_ints, count)
+        return vmap(_get_reward)(dmaps, self.true_ints)
 
-    def move_from_native(self, key, reset_idxs, deviation, config):
+    def move_from_native(self, key, reset_idxs, deviation):
         true_coords = self.coord_ligs
         lig_RMSDs = vmap(rmsd)(true_coords, self.coord_ligs, self.length_ligs)
 
@@ -301,7 +338,7 @@ class DockingEnv():
                     dmaps, self.padmask_recs, self.padmask_ligs)
 
             # while there is some illegal move
-            while illegal_interfaces(dmaps, config, False):
+            while illegal_interfaces(dmaps, self.config, False):
                 
                 # new actions set
                 key, key_n = jrn.split(key, 2)
@@ -310,7 +347,7 @@ class DockingEnv():
                 quats_new = vmap(quat_from_pivoting)(Ps_new, p1s_new, p2s_new)
 
                 # set new quaternions and pivot points for illegal actions
-                illegal_idxs = get_illegal_idxs(dmaps, config)
+                illegal_idxs = get_illegal_idxs(dmaps, self.config)
                 for idx in all_idxs:
                     if idx in illegal_idxs: 
                         quats = quats.at[idx].set(quats_new[idx])
@@ -330,7 +367,7 @@ class DockingEnv():
             for idx in all_idxs:
                 if idx not in reset_idxs: lig_RMSDs = lig_RMSDs.at[idx].set(deviation)
                 
-        print ('New starting RMSD after reset:', lig_RMSDs)
+        #print ('New starting RMSD after reset:', lig_RMSDs)
 
 if __name__ == '__main__':
     sys.exit()

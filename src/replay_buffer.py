@@ -4,7 +4,7 @@ import jax.numpy as jnp
 import jax.random as jrn
 from jax.tree_util import tree_map
 from functools import partial
-from jax import jit
+from jax import jit, vmap
 
 class ReplayBuffer():
     def __init__(self, config, plist):
@@ -19,12 +19,12 @@ class ReplayBuffer():
 
         self.buff_size = config['buffer_size']
 
-        c_num = self.pair_number
-        i_num = c_num*self.pad*self.enum*2*2*2
-        e_num = c_num*self.pad*self.enum*2*15*2*4
-        m_num = c_num*self.pad*2*2*2
-        a_num = c_num*3*self.pad*4
-        r_num = c_num*4
+        p_num = self.pair_number
+        i_num = p_num*self.pad*self.enum*2*2*2
+        e_num = p_num*self.pad*self.enum*2*15*2*4
+        m_num = p_num*self.pad*2*2*2
+        a_num = p_num*3*self.pad*4
+        r_num = p_num*4
 
         tot_ex = i_num+e_num+m_num+a_num+r_num
         self.cache_size = int(jnp.floor((config['cache_gb']*1e9)/tot_ex))
@@ -83,7 +83,7 @@ class ReplayBuffer():
                 actions, rewards]
 
     @partial(jit, static_argnums=(0,))
-    def add_to_cache(self, cache, experience, actual):
+    def add_experience(self, cache, experience, actual):
         
         for idx, new in enumerate(experience):
             cache[idx] = jnp.concatenate((new[:,None], cache[idx][:,:-1]), axis=1)
@@ -104,15 +104,15 @@ class ReplayBuffer():
 
 
     @partial(jit, static_argnums=(0,))
-    def sample_from_buffer(self, key, data, actual):
+    def sample_from_buffer(self, key, data):
 
         def _sample(ex_data, nkey):
-            ex_idxs = jrn.choice(nkey, actual, shape=(self.bsn,), replace=False)
+            ex_idxs = jrn.choice(nkey, self.buff_size, shape=(self.bsn,), replace=False)
             return ex_data[ex_idxs]
 
         # select a number of protein pairs to draw examples from
         key, pkey = jrn.split(key, 2)
-        pair_idxs = jrn.choice(pkey, self.pair_num, shape=(self.bsp,), replace=False)
+        pair_idxs = jrn.choice(pkey, self.pair_number, shape=(self.bsp,), replace=False)
         
         # create an array with a different key for each pair
         nkeys = jrn.split(key, self.bsp)
@@ -123,4 +123,4 @@ class ReplayBuffer():
         for pair_ex_data in data:
             batch.append(vmap(_sample)(pair_ex_data[pair_idxs], nkeys))
         
-        return batch
+        return batch, pair_idxs

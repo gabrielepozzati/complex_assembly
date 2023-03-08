@@ -1,13 +1,35 @@
 import os
 import sys
-import jax
 import glob
-import jraph
 import pickle as pkl
 from functools import partial
-import jax.numpy as jnp
+from gpuinfo.nvidia import get_gpus
+
+import jax
 import pdb as debug
+import jax.numpy as jnp
 from jax import vmap, jit
+
+
+def get_pmap_details():
+    pmap_count = {}
+    for gpu in get_gpus():
+        idx = gpu.__dict__['index']
+        name = gpu.__dict__['name']
+        pmap_count[name] = pmap_count.get(name, [])
+        pmap_count[name].append(idx)
+
+    pmap_maxsize = 0
+    for gputype in pmap_count:
+        if len(pmap_count[gputype]) > pmap_maxsize:
+            pmap_maxsize = len(pmap_count[gputype])
+            pmap_devices = pmap_count[gputype]
+
+    gpus = jax.devices('gpu')
+    pmap_devices = [gpus[idx] for idx in pmap_devices]
+
+    return pmap_maxsize, pmap_devices
+
 
 def load_dataset(path, size=None, skip=0):
     count = 0
@@ -57,18 +79,27 @@ def illegal_interfaces(dmaps, config, debug):
     if debug: print (distances)
 
     if jnp.any(distances > config['interface_threshold']) \
-    or jnp.any(distances < config['clash_threshold']): return True
+    or jnp.any(distances < config['clash_threshold_all']): return True
     else: return False
 
 
-def get_illegal_idxs(dmaps, config):
+def get_illegal_idxs(dmaps, config, reset=None, debug=False):
     dmaps = jnp.where(dmaps==0, 1e9, dmaps)
     distances = vmap(lambda x: jnp.min(x))(dmaps)
+    if debug: print (distances) 
 
     i_thr = config['interface_threshold']
-    c_thr = config['clash_threshold']
-
-    return jnp.argwhere((distances>i_thr)|(distances < c_thr))
+    c_thr = config['clash_threshold_all']
+    
+    if reset is not None:
+        conditions = ((distances>i_thr)|\
+                      (distances<c_thr)|\
+                      (reset>=config['episode_max_len']))
+    else:
+        conditions = ((distances>i_thr)|\
+                      (distances<c_thr))
+    
+    return jnp.argwhere(conditions)
 
 
 def kabsch(dept, dest):
@@ -158,7 +189,7 @@ def trilateration(c_rec, l_rec, idxs, dist):
 def unfold_features(mask, nodes, edges, i, j):
     mask_rec, mask_lig = jnp.split(mask, 2, axis=0)
     padmask_rec, intmask_rec, rimmask_rec = mask_rec[:,0], mask_rec[:,1], mask_rec[:,2]
-    padmask_lig, intmask_lig, rimmask_lig = mask_lig[:,0], mask_lig[:,1], mask_rec[:,2]
+    padmask_lig, intmask_lig, rimmask_lig = mask_lig[:,0], mask_lig[:,1], mask_lig[:,2]
 
     nodes_rec, nodes_lig = jnp.split(nodes, 2, axis=0)
 

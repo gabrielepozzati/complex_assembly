@@ -5,24 +5,33 @@ class Critic(hk.Module):
     def __init__(self, config):
         super().__init__(name='Critic')
 
+        self.config = config
         self.ch = config['channels']
         self.un = config['update_number']
         self.mlp = config['mlp_layers']
 
-        self.action_update = vmap(MLP(self.ch, int(self.ch/2), self.mlp, name='action_update'))
+        self.action_update = vmap(
+                MLP(self.ch, int(self.ch/2), self.mlp, name='action_update'))
 
         self.node_layers1, self.node_layers2, self.edge_layers = [], [], []
         for n in range(self.un):
-            self.node_layers1.append(vmap(MPNN(config, False, name=f'action_MPNN{n}')))
-            self.edge_layers.append(vmap(MPNN(config, True, name=f'pivot_MPNN{n}')))
-            self.node_layers2.append(vmap(MPNN(config, False, name=f'eval_MPNN{n}')))
+            self.node_layers1.append(
+                    vmap(MPNN(config, False, name=f'action_MPNN{n}')))
 
-        self.global_update = vmap(MLP(self.ch, int(self.ch/2), self.mlp, name='global_update'))
-        self.out_update = Linear(self.ch, num_input_dims=2, name='out')
+            self.edge_layers.append(
+                    vmap(MPNN(config, True, name=f'pivot_MPNN{n}')))
+
+            self.node_layers2.append(
+                    vmap(MPNN(config, False, name=f'eval_MPNN{n}')))
+
+        self.global_update = vmap(
+                MLP(self.ch, int(self.ch/2), self.mlp, name='global_update'))
+
+        self.out_update = vmap(Linear(1, num_input_dims=2, name='out'))
 
 
     def __call__(self, masks, nodes, edges, i_s, j_s, actions):
- 
+        
         (padmask_recs, padmask_ligs, 
          intmask_recs, intmask_ligs, 
          rimmask_recs, rimmask_ligs, 
@@ -76,5 +85,5 @@ class Critic(hk.Module):
         # aggregate graph to a single value
 
         all_nodes = self.global_update(all_nodes)
-        return jax.nn.sigmoid(self.out_update(all_nodes))
+        return jax.nn.sigmoid(self.out_update(all_nodes))*100
 

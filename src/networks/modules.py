@@ -36,7 +36,7 @@ def get_initializer_scale(initializer_name, input_shape):
     # Adjust stddev for truncation.
     stddev = stddev / TRUNCATED_NORMAL_STDDEV_FACTOR
     w_init = hk.initializers.TruncatedNormal(mean=0.0, stddev=stddev)
-
+  
   return w_init
 
 
@@ -145,7 +145,7 @@ class MLP(hk.Module):
 
     x = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
     
-    return jax.nn.relu(self.out_layer(x))
+    return self.out_layer(x)
 
 
 class MHA(hk.Module):
@@ -220,31 +220,45 @@ class MPNN(hk.Module):
     self.message_mlp = MLP(
             channels, channels, layer_num, name=name+'_message')
     
+    self.ln1 = hk.LayerNorm(axis=-1, name=name+'_ln1',
+            create_scale=True, create_offset=True)
     self.node_transf1 = Linear(channels, name=name+'_nodetr1')
+    self.ln2 = hk.LayerNorm(axis=-1, name=name+'_ln2',
+            create_scale=True, create_offset=True)
     self.node_update = Linear(channels, name=name+'_nodeup')
     
     if self.edge_up:
+      self.ln3 = hk.LayerNorm(axis=-1, name=name+'_ln3',
+              create_scale=True, create_offset=True)
       self.node_transf2 = Linear(channels, name=name+'_nodetr2')
+      self.ln4 = hk.LayerNorm(axis=-1, name=name+'_ln4',
+              create_scale=True, create_offset=True)
       self.edge_update = Linear(channels, name=name+'_edgeup')
 
   def __call__(self, nodes, edges, i, j):
     n_i, n_j = nodes[i], nodes[j]
     n_ij = jnp.concatenate((n_i, n_j, edges), axis=-1)
-    m_i = self.message_mlp(n_ij)
+    m_i = jax.nn.relu(self.message_mlp(n_ij))
 
-    shape = (nodes.shape[0], int(edges.shape[0]/nodes.shape[0]), 
+    shape = (nodes.shape[0], 
+             int(edges.shape[0]/nodes.shape[0]), 
              m_i.shape[-1])
     m_i = jnp.reshape(m_i, shape)
     m_i = jnp.sum(m_i, axis=1)
     
+    nodes = self.ln1(nodes)
     n_up = jax.nn.relu(self.node_transf1(nodes))
     n_up = jnp.concatenate((n_up, m_i), axis=-1)
+    n_up = self.ln2(n_up)
     n_up = jax.nn.relu(self.node_update(n_up))
 
     if self.edge_up:
       n_ij = jnp.concatenate((n_i, n_j), axis=-1)
+      n_ij = self.ln3(n_ij)
       n_ij = jax.nn.relu(self.node_transf2(n_ij))
+
       e_up = jnp.concatenate((edges, n_ij), axis=-1)
+      e_up = self.ln4(e_up)
       e_up = jax.nn.relu(self.edge_update(e_up))
       return n_up, e_up
     
