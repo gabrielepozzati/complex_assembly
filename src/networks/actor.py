@@ -62,18 +62,6 @@ class Actor(hk.Module):
         node_recs = jax.nn.relu(self.node_input(node_recs))
         node_ligs = jax.nn.relu(self.node_input(node_ligs))
 
-        # placeholders for P, p1 and p2 pseudo-feats
-        #node_Ps = jnp.zeros(node_recs.shape)
-        #node_p1s = jnp.zeros(node_recs.shape)
-        #node_p2s = jnp.zeros(node_recs.shape)
-
-        # merge pseudo-feats to node features
-        #node_Pp1s = jnp.concatenate((node_Ps, node_p1s), axis=2)
-        #node_Pp1s = jax.nn.relu(self.Pp1_merge(node_Pp1s))
-
-        #node_recs = jnp.concatenate((node_recs, node_p2s), axis=2)
-        #node_ligs = jnp.concatenate((node_ligs, node_Pp1s), axis=2)            
-
         # node-wise only, intra protein MPNN
         for n in range(self.un):
             node_recs = self.node_layers1[n](node_recs,edge_recs,i_recs,j_recs)
@@ -91,14 +79,14 @@ class Actor(hk.Module):
         node_Ps = self.P_join(node_ligs)*padmask_ligs[:,:,None]
         node_p1s = self.p1_join(node_ligs)*padmask_ligs[:,:,None]
         node_p2s = self.p2_join(node_recs)*padmask_recs[:,:,None]
-        
+
         # merge pseudo-feats to node features
         node_Pp1s = jnp.concatenate((node_Ps, node_p1s), axis=2)
         node_Pp1s = jax.nn.relu(self.Pp1_merge(node_Pp1s))
 
         node_recs = jnp.concatenate((node_recs, node_p2s), axis=2)
         node_ligs = jnp.concatenate((node_ligs, node_Pp1s), axis=2)
-
+        
         # node-wise only, intra protein MPNN
         for n in range(self.un):
             node_recs = self.node_layers2[n](node_recs,edge_recs,i_recs,j_recs)
@@ -108,10 +96,6 @@ class Actor(hk.Module):
         node_Ps = jax.nn.softmax(jnp.squeeze(self.P_out(node_Ps)))*intmask_ligs
         node_p1s = jax.nn.softmax(jnp.squeeze(self.p1_out(node_p1s)))*rimmask_ligs
         node_p2s = jax.nn.softmax(jnp.squeeze(self.p2_out(node_p2s)))*rimmask_recs
-        
-        node_Ps = jnp.squeeze(node_Ps)
-        node_p1s = jnp.squeeze(node_p1s)
-        node_p2s = jnp.squeeze(node_p2s)
 
         return jnp.stack((node_Ps,node_p1s,node_p2s), axis=1)
 

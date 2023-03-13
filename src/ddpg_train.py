@@ -88,6 +88,8 @@ if __name__ == "__main__":
                     mask_ints, edge_ints, i_ints, j_ints, all_idxs, 1, 1)
 
     # replay buffer setup
+    bs = config['batch_size_num']
+    bp = config['batch_size_pair']
     r_buffer = ReplayBuffer(config, envs.list)
 
     ####################################################
@@ -113,10 +115,12 @@ if __name__ == "__main__":
     a_params = actor.init(akey, 
             mask[0], nodes[0], edges[0], i[0], j[0])
     
+    print (mask[0].shape, nodes[0].shape, edges[0].shape)
     # critic parameters initialization
     action = a_apply_s(a_params, None, 
             mask[0], nodes[0], edges[0], i[0], j[0])
-
+    print (action.shape)
+    #if len(action.shape)<3: action = action[None,:,:]
     c_params = critic.init(ckey, 
             mask[0], nodes[0], edges[0], i[0], j[0], action)
 
@@ -174,7 +178,7 @@ if __name__ == "__main__":
     # function to compute target q value
     get_target_reward = jax.jit(
             lambda x, y: jnp.ravel(x) + (config['gamma']*jnp.ravel(y)))
-
+    
     # function to update parameters
     @jax.jit
     def update_actor_params(grads, state):
@@ -299,7 +303,6 @@ if __name__ == "__main__":
         a_params = actor_state.params
         actions = a_apply_s(actor_state.params, None, 
                 masks[0], nodes[0], edges[0], i[0], j[0])
-        actions = jnp.squeeze(actions)
 
         # elaborate action to apply to environment
         actions_t = vmap(lambda x: jnp.argmax(x, axis=1))(actions)
@@ -334,38 +337,25 @@ if __name__ == "__main__":
 
         sg = time.time()
         # buffer update
-        if global_step <= config['buffer_size'] \
-        and r_buffer.cache_actual < r_buffer.cache_size:
+        if r_buffer.cache_actual < r_buffer.cache_size:
             # fast storage into a reduced size cache on GPU
             r_buffer.cache, r_buffer.cache_actual = \
                     r_buffer.add_experience(r_buffer.cache, experience, r_buffer.cache_actual)
 
-        elif global_step <= config['buffer_size'] \
-        and r_buffer.cache_actual == r_buffer.cache_size:
-            
+        else:    
             # when cache is full move it to CPU
             r_buffer.cache = jax.device_put(r_buffer.cache, device=jax.devices('cpu')[0])
             
             # slow update of full buffer stored on CPU
-            r_buffer.buff, r_buffer.cache, buff_actual = \
-                    r_buffer.add_to_buffer(r_buffer.buff, r_buffer.cache, r_buffer.buff_actual)
+            r_buffer.buff, r_buffer.cache = \
+                    r_buffer.add_to_buffer(r_buffer.buff, r_buffer.cache)
             
             # move empty cache back to GPU
             r_buffer.cache = jax.device_put(r_buffer.cache, device=jax.devices('gpu')[0])
             
-            # update count of examples in cache and buffer
-            r_buffer.buff_actual = min(buff_actual, r_buffer.buff_size)
+            # update count of examples in cache
             r_buffer.cache_actual = 0
 
-        elif global_step > config['buffer_size']:
-
-            # move experience to CPU
-            experience = jax.device_put(experience, device=jax.devices('cpu')[0])
-            
-            # update buffer with example
-            r_buffer.buff, _ = \
-                r_buffer.add_experience(r_buffer.buff, experience, r_buffer.buff_actual)
-        
         print (f'Buffer update done! - {time.time()-sg}')
 
         sg = time.time()
@@ -417,18 +407,20 @@ if __name__ == "__main__":
         if global_step+1 > config['buffer_size'] \
         and (global_step+1) % config['update_frequency'] == 0:
             
-            # sample example batch
             key, nkey = jrn.split(key, 2)
-            batch, pair_idxs = r_buffer.sample_from_buffer(nkey, r_buffer.buff)    
-            batch = [jax.device_put(array, device=gpus[1]) for array in batch]
-            pair_idxs = jax.device_put(pair_idxs, device=gpus[1])
 
+            # get batch and pass it to GPU
+            batch, pair_idxs = r_buffer.sample_from_buffer(
+                    nkey, r_buffer.buff)
+            batch = [jax.device_put(array, device=gpus[0]) for array in batch]
+            pair_idxs = jax.device_put(pair_idxs, device=gpus[0])
+
+            # unpack batch
             (mask_ints_P, edge_ints_P, i_ints_P, j_ints_P,
              mask_ints_N, edge_ints_N, i_ints_N, j_ints_N,
              actions, rewards) = batch
 
             # format batch
-            bs, ps = config['batch_size_num'], pmap_maxsize
             masks_P, nodes_P, edges_P, i_P, j_P = envs.format_input_state(
                     mask_ints_P, edge_ints_P, i_ints_P, j_ints_P, pair_idxs, bs, ps)
 
@@ -436,9 +428,9 @@ if __name__ == "__main__":
                     mask_ints_N, edge_ints_N, i_ints_N, j_ints_N, pair_idxs, bs, ps)
             
             bp = len(pair_idxs)
-            new_shape = (ps, int(bs*bp/ps),) + actions.shape[-2:]
+            new_shape = (ps, int(bp*bs/ps),) + actions.shape[-2:]
             actions = jnp.reshape(actions, new_shape)
-            new_shape = (ps, int(bs*bp/ps),)
+            new_shape = (ps, int(bp*bs/ps),)
             rewards = jnp.reshape(rewards, new_shape)
             
             # update critic parameters

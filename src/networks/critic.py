@@ -54,9 +54,9 @@ class Critic(hk.Module):
 
         # refine action feature to concatenate with nodes
         fillers = jnp.zeros(actions[:,0,:].shape)
-        Ps = jnp.squeeze(actions[:,0,:])
-        p1s = jnp.squeeze(actions[:,1,:])
-        p2s = jnp.squeeze(actions[:,2,:])
+        Ps = actions[:,0,:]
+        p1s = actions[:,1,:]
+        p2s = actions[:,2,:]
         action_Ps = jnp.concatenate((fillers, Ps), axis=1)
         action_p1p2s = jnp.concatenate((p2s, p1s), axis=1)
         actions = jnp.concatenate(

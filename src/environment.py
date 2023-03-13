@@ -169,7 +169,7 @@ class DockingEnv():
         padmasks = jnp.concatenate((self.padmask_recs, self.padmask_ligs), axis=1)
         padmasks = padmasks[idxs][:,None,:,None]
         padmasks =  jnp.broadcast_to(padmasks, (bp, bs, size*2, 1))
-        if len(masks.shape) < 4: masks = masks[:,None,:,:]
+        masks = jnp.reshape(masks, (bp, bs, size*2, 2))
         masks = jnp.concatenate((padmasks, masks), axis=3)
         masks = jnp.reshape(masks, (ps, fs, size*2, 3))
         
@@ -182,21 +182,21 @@ class DockingEnv():
         intra_edges = jnp.concatenate((self.edge_recs, self.edge_ligs), axis=1)
         intra_edges = intra_edges[idxs][:,None,:,:]
         intra_edges = jnp.broadcast_to(intra_edges, (bp, bs, size*enum*2, 15))
-        if len(edges.shape) < 4: edges = edges[:,None,:,:]
+        edges = jnp.reshape(edges, (bp, bs, size*enum*2, 15))
         edges = jnp.concatenate((intra_edges, edges), axis=2)
         edges = jnp.reshape(edges, (ps, fs, size*enum*4, 15))
 
         intra_sends = jnp.concatenate((self.send_recs, self.send_ligs), axis=1)
         intra_sends = intra_sends[idxs][:,None,:]
         intra_sends = jnp.broadcast_to(intra_sends, (bp, bs, size*enum*2))
-        if len(sends.shape) < 3: sends = sends[:,None,:]
+        sends = jnp.reshape(sends, (bp, bs, size*enum*2))
         sends = jnp.concatenate((intra_sends, sends), axis=2)
         sends = jnp.reshape(sends, (ps, fs, size*enum*4))
 
         intra_neighs = jnp.concatenate((self.neigh_recs, self.neigh_ligs), axis=1)
         intra_neighs = intra_neighs[idxs][:,None,:]
         intra_neighs = jnp.broadcast_to(intra_neighs, (bp, bs, size*enum*2))
-        if len(neighs.shape) < 3: neighs = neighs[:,None,:]
+        neighs = jnp.reshape(neighs, (bp, bs, size*enum*2))
         neighs = jnp.concatenate((intra_neighs, neighs), axis=2)
         neighs = jnp.reshape(neighs, (ps, fs, size*enum*4))
 
