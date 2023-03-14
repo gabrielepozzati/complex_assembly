@@ -449,24 +449,26 @@ if __name__ == "__main__":
             loss_series.append(crit_loss)
             mean_reward = jnp.mean(rewards)
             reward_series.append(mean_reward)
-            print (f'\nCritic loss:{crit_loss}, Reward: {mean_reward}')
+            print (f'\n{global_step} - Critic loss:{crit_loss}, Reward: {mean_reward}')
+            
+            if global_step%1000 == 0:
+                _loss_series = list(np.array(loss_series))
+                _reward_series = list(np.array(reward_series))
+                _step = list(range(len(loss_series)))
 
-    loss_series = list(np.array(loss_series))
-    reward_series = list(np.array(reward_series))
-    step = list(range(len(loss_series)))
-
-    data = {'steps':step, 'loss':loss_series, 'reward':reward_series}
+                plot_data = {'steps':_step, 'loss':_loss_series, 'reward':_reward_series}
     
-    sb.violinplot(x='labels', y='rewards', data=delta_series)
-    plt.savefig('rewards.png')
-    sb.violinplot(x='labels', y='rmsds', data=delta_series)
-    plt.savefig('rmsds.png')
+                g = sb.lineplot(data=plot_data, x='steps', y='loss')
+                sb.lineplot(data=plot_data, x='steps', y='reward', color='red', ax=g.axes.twinx())
+                plt.savefig('train.png')
 
-    g = sb.lineplot(data=data, x='steps', y='loss')
-    sb.lineplot(data=data, x='steps', y='reward', color='red', ax=g.axes.twinx())
-    plt.savefig('train.png')
+                with open('params.pkl', 'wb') as out: pkl.dump(actor_state.params, out)
 
-    with open('params.pkl', 'wb') as out: pkl.dump(actor_state.params, out)
+    #sb.violinplot(x='labels', y='rewards', data=delta_series)
+    #plt.savefig('rewards.png')
+    #sb.violinplot(x='labels', y='rmsds', data=delta_series)
+    #plt.savefig('rmsds.png')
+
 
     ####################################################
     # INDEPENDENT TEST
